@@ -5,7 +5,7 @@ description: Review and clean up a Bilibili (B站) following list end-to-end —
 
 # B 站关注列表梳理与批量取关
 
-把「关注列表」变成「可筛选的清单」，再安全地批量取关。全程脚本化，判断类工作交给 subagent 以免占满上下文。
+把「关注列表」变成「可筛选的清单」，再安全地批量取关。全程脚本化，判断类工作（打标/分类）**推荐**用 subagent 来做，以免占满主上下文——但并非强制，量少时也可在主上下文里直接完成。
 
 ## 何时使用
 
@@ -52,8 +52,8 @@ python fetch_videos.py           # wbi 签名调 x/space/wbi/arc/search，取最
 # 产出 following_videos.json
 python split_chunks.py           # 切成 8 份 chunks/chunk_XX.json
 ```
-再用 **subagent 批量打标**：让每个 subagent 读一份 `chunks/chunk_XX.json`，结合昵称/签名/认证/视频标题，为每个号生成一个 2–14 字中文「内容定位」标签，写 `labels_XX.json`（字段 `mid/uname/label/reason`）。
-- 为什么用 subagent：几百个账号，避免主上下文被视频标题塞满。
+再对每个 `chunk_XX.json` 打标：结合昵称/签名/认证/视频标题，为每个号生成一个 2–14 字中文「内容定位」标签，写 `labels_XX.json`（字段 `mid/uname/label/reason`）。
+- **推荐用 subagent**（`task` 工具）逐份处理：几百个账号，避免主上下文被视频标题塞满。**不强制**——账号少时直接在主上下文里打标即可。
 
 ### 3. 合并 + 人工筛选（本地网页）
 ```
@@ -65,7 +65,8 @@ python build_selector.py         # 合并 -> combined.json + selector.html
 ```
 python analyze_split.py          # -> chunks_analysis/aXX.json
 ```
-再用 **subagent 分类**：按下面 8 类给每个号 `类型 + 优先级(高/中/低) + 是否建议取关 + 理由`，写 `analyze_out_XX.json`。
+再对每份 `aXX.json` 分类：按下面 8 类给每个号 `类型 + 优先级(高/中/低) + 是否建议取关 + 理由`，写 `analyze_out_XX.json`。
+- **推荐用 subagent**（`task` 工具）逐份处理；**不强制**，账号少时也可直接做。
 
 | 类型 | 含义 |
 |---|---|
@@ -119,10 +120,10 @@ python retry_unfollow.py         # 8–16s 间隔，-352 退避 25–45s，最�
 | `cookie.txt` | 提取/用户提供 | 登录 Cookie（敏感） |
 | `following.json/.csv` | fetch_following.py | 全量关注 |
 | `following_videos.json` | fetch_videos.py | 每人近期投稿标题 |
-| `labels_XX.json` | subagent | 内容定位标签 |
+| `labels_XX.json` | 打标（推荐 subagent） | 内容定位标签 |
 | `combined.json` | build_selector.py | 合并后的主数据 |
 | `selector.html` | build_selector.py | 勾选网页 |
-| `analyze_out_XX.json` | subagent | 类型/优先级 |
+| `analyze_out_XX.json` | 分类（推荐 subagent） | 类型/优先级 |
 | `unfollow.txt` | 用户/网页导出 | 待取关 mid 列表 |
 | `unfollow_log.json` | unfollow.py | 取关结果 |
 | `retry_log.json` | retry_unfollow.py | 风控重试结果 |

@@ -7,7 +7,7 @@
 ## 它做什么
 
 1. **拉全量关注** —— 登录态分页读取，导出 JSON/CSV。
-2. **判断每个号是做什么的** —— 抓每人最近 6 个投稿标题，由 subagent 给出内容定位标签。
+2. **判断每个号是做什么的** —— 抓每人最近 6 个投稿标题，生成内容定位标签（推荐用 subagent）。
 3. **本地网页勾选** —— `selector.html`，搜索/按内容分类/勾选/导出待取关列表。
 4. **（可选）分类打分** —— 按 8 种取关判断给类型 + 优先级。
 5. **（可选）补粉丝量** —— 免登录接口，辅助判断「信息重复」。
@@ -30,7 +30,7 @@ python extract_cookie_firefox.py
 # 2) 拉关注 + 抓投稿
 python fetch_following.py
 python fetch_videos.py
-python split_chunks.py          # 交给 subagent 打标 -> labels_XX.json
+python split_chunks.py          # 再打标（推荐用 subagent）-> labels_XX.json
 
 # 3) 生成勾选网页
 python build_selector.py        # 打开 selector.html，勾选后导出 unfollow.txt
@@ -53,8 +53,8 @@ bili-following-cleanup/
    ├─ fetch_following.py         # 拉全量关注
    ├─ fetch_videos.py            # 抓每人近期投稿（wbi 签名）
    ├─ fetch_fans.py              # 补粉丝/等级/播放（免登录）
-   ├─ split_chunks.py            # 切块给 subagent 打标
-   ├─ analyze_split.py           # 切块给 subagent 分类
+   ├─ split_chunks.py            # 切块供打标（推荐 subagent）
+   ├─ analyze_split.py           # 切块供分类（推荐 subagent）
    ├─ build_selector.py          # 合并 + 生成 selector.html
    ├─ unfollow.py                # 批量取关
    └─ retry_unfollow.py          # 风控失败重试
