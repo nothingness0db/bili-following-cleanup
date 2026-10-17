@@ -1,0 +1,27 @@
+# --- 敏感/个人数据：切勿提交 ---
+cookie.txt
+*.cookie
+retry.txt
+unfollow.txt
+
+# --- 运行产出的数据 ---
+following.json
+following.csv
+following_videos.json
+following_enriched.json
+combined.json
+recommend.txt
+recommend_report.txt
+unfollow_log.json
+retry_log.json
+labels_*.json
+analyze_out_*.json
+chunks/
+chunks_analysis/
+selector.html
+
+# --- Python ---
+__pycache__/
+*.pyc
+.venv/
+venv/
