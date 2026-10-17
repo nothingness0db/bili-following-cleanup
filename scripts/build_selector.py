@@ -20,6 +20,8 @@ for f in sorted(glob.glob(str(BASE / "analyze_out_*.json"))):
     for r in json.loads(Path(f).read_text(encoding="utf-8")):
         an[str(r["mid"])] = r
 
+PROTECT_TOP = 50
+
 for r in rows:
     a = an.get(str(r["mid"]), {})
     r["type"] = a.get("type", 0)
@@ -28,6 +30,12 @@ for r in rows:
     r["unfollow"] = a.get("unfollow", False)
     r["why"] = a.get("reason", "")
     r.pop("reco", None)
+    vr = r.get("visit_rank")
+    r["protected"] = vr is not None and vr <= PROTECT_TOP
+    if r["protected"]:
+        r["unfollow"] = False
+        note = f"最常访问 #{vr}（前 {PROTECT_TOP}）· 保护，不建议取关"
+        r["why"] = (r["why"] + "；" + note) if r["why"] else note
 
 (BASE / "combined.json").write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -36,7 +44,8 @@ print("类型分布：")
 for k, n in cnt.most_common():
     print(f"  {n:4}  {k}")
 uf = sum(1 for r in rows if r["unfollow"])
-print(f"建议取关合计 {uf} / {len(rows)}")
+pr = sum(1 for r in rows if r.get("protected"))
+print(f"建议取关合计 {uf} / {len(rows)}（其中最常访问前 {PROTECT_TOP} 保护 {pr} 个）")
 
 data = json.dumps(rows, ensure_ascii=False)
 html = r"""<!doctype html>
@@ -66,6 +75,7 @@ html = r"""<!doctype html>
  .pr{display:inline-block;font-size:11px;padding:0 6px;border-radius:6px;margin-left:4px;border:1px solid #ccc;color:#666}
  .pr.高{background:#ffdede;color:#c00;border-color:#fbb}
  .pr.中{background:#fff3d6;color:#a80;border-color:#ee4}
+ .prot{display:inline-block;font-size:11px;font-weight:600;padding:1px 7px;border-radius:6px;margin-left:6px;background:#e6f4ea;color:#1a7f37;border:1px solid #b7e0c2}
  .why{color:#c00;font-size:12px;margin-top:2px}
  a{color:#4a90d9;text-decoration:none;font-size:12px}
  #bar{color:#666;font-size:13px;margin-left:8px}
@@ -108,7 +118,7 @@ function render(){const ul=document.getElementById('list');ul.innerHTML='';let s
     const li=document.createElement('li');if(selected.has(r.mid))li.className='sel';
     li.innerHTML=`<input class="chk" type="checkbox" ${selected.has(r.mid)?'checked':''}>
       <div>
-        <div><span class="lab">${esc(r.label)}</span><span class="name">${esc(r.uname)}</span> <span class="mid">uid ${r.mid} · 粉丝 ${fmtFans(r.fans)}${r.level!=null?' · Lv'+r.level:''}${r.last_days!=null?' · 停更'+r.last_days+'天':''}</span>${r.official?`<span class="tag">${esc(r.official)}</span>`:''}<span class="tp ${r.unfollow?'unf':''}">${r.type} ${esc(r.type_name)}</span><span class="pr ${r.priority}">${esc(r.priority)}</span></div>
+        <div><span class="lab">${esc(r.label)}</span><span class="name">${esc(r.uname)}</span> <span class="mid">uid ${r.mid} · 粉丝 ${fmtFans(r.fans)}${r.level!=null?' · Lv'+r.level:''}${r.last_days!=null?' · 停更'+r.last_days+'天':''}</span>${r.official?`<span class="tag">${esc(r.official)}</span>`:''}<span class="tp ${r.unfollow?'unf':''}">${r.type} ${esc(r.type_name)}</span><span class="pr ${r.priority}">${esc(r.priority)}</span>${r.protected?`<span class="prot">保护 #${r.visit_rank}</span>`:''}</div>
         ${r.why?`<div class="why">↳ ${esc(r.why)}</div>`:''}
         ${r.sign?`<div class="sign">${esc(r.sign)}</div>`:''}
         <div class="vids">${r.videos.map(t=>`<span>${esc(t)}</span>`).join('')||'<i>(没有抓到投稿)</i>'}</div>

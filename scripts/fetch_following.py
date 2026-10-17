@@ -70,6 +70,7 @@ def fetch_all(client: httpx.Client, uid: int) -> list:
                     "official": (it.get("official_verify") or {}).get("desc"),
                     "official_type": (it.get("official_verify") or {}).get("type"),
                     "mtime": it.get("mtime"),
+                    "visit_rank": len(out) + 1,
                     "space": f"https://space.bilibili.com/{it.get('mid')}",
                 }
             )
@@ -100,7 +101,7 @@ def main():
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()) if rows else ["mid", "uname"])
         w.writeheader()
         w.writerows(rows)
-    print(f"完成：{len(rows)} 条 -> {OUT_JSON.name} / {OUT_CSV.name}")
+    print(f"完成：{len(rows)} 条 -> {OUT_JSON.name} / {OUT_CSV.name}（visit_rank 按「最常访问」排序）")
 
 
 if __name__ == "__main__":

@@ -52,8 +52,9 @@ description: Review and clean up a Bilibili (B站) following list end-to-end —
 ### 1. 拉全量关注（拿到 UID 列表）
 ```
 python fetch_following.py        # nav 校验登录 -> 分页 x/relation/followings
-# 产出 following.json / following.csv（mid、昵称、签名、认证、关注时间）
+# 产出 following.json / following.csv（mid、昵称、签名、认证、关注时间、visit_rank）
 ```
+接口用 `order_type=attention` 返回的是**「最常访问」排序**——越靠前你越常点进去。脚本把名次写成 `visit_rank`（1..N），供 4.5 的保护逻辑用。
 
 ### 2. 抓每人近期投稿
 ```
@@ -118,14 +119,25 @@ python analyze_split.py          # -> chunks_analysis/aXX.json
 
 > 说明：这是**开口的思考框架**，一个号可能同时符合多条；让 subagent 选「最主要的那一条」，并在 `reason` 里写清依据。类型 1–7 → `unfollow=true`；类型 8 / 0 → `unfollow=false`。
 
+### 4.5 最常访问保护（不可跳过）
+
+`visit_rank`（来自第 1 步）是「最常访问」名次。**你几乎不可能取关自己最常访问的号**，所以设一条保护线：`build_selector.py` 里 `PROTECT_TOP = 50`，凡 `visit_rank <= 50` 一律**强制** `unfollow=false`，并在 `why` 标注「保护」。
+
+- K 默认 50，可按用户意愿调（越小越激进）。
+- 保护是**硬覆盖**：即使分类 subagent 判了类型 1–7，也不会被改回取关。
+- 这只是给用户的参考护栏，**不改变**「取关决定权归用户」——用户仍可在页面里自行勾选。
+
 ### 5. 补粉丝量（不可跳过）
 ```
 python fetch_fans.py             # 免登录：card 取粉丝/等级，upstat 取播放/点赞 -> 写入 combined.json
 python build_selector.py         # 合并分析 + 粉丝 -> 最终 selector.html
+python visualize.py              # 生成 map.html，内嵌图谱和现有勾选页面
 ```
 页面显示 `粉丝 · Lv · 停更天数`，并支持「按粉丝」排序——用于处理「信息重复」：同内容里保粉丝多的、清少的。
 
 ### 6. 用户勾选（唯一的人工停顿点）
+先打开 `map.html` 查看关注图谱，点击或向左拉动右侧「开始清理」拉柄，经黑屏过场进入现有勾选界面。`map.html` 已内嵌数据与勾选页面，直接双击打开即可，无需启动 HTTP 服务；不要为了这个流程搭建服务器。`selector.html` 保留为独立入口。
+
 打开 `selector.html`（数据内嵌、免联网）：搜索 / 按内容 / 按类型 / 按优先级 / 按粉丝 / 按停更任意组合筛选，由用户**自己勾选** → **导出 unfollow.txt**（下载 + 复制剪贴板）。
 
 > ⚠️ 这一步**必须等用户自己挑**。不要替他勾、不要问「我帮你把建议的那批全取关好吗？」——按上面的核心原则来。
@@ -147,6 +159,7 @@ python build_selector.py         # 已成功取关的自动从清单/页面剔�
 ## 关键接口与坑
 
 - 关注列表：`GET x/relation/followings?vmid=&pn=&ps=50`（需登录 Cookie）。
+- **最常访问排序 / `visit_rank`**：`GET x/relation/followings?...&order=desc&order_type=attention` —— `attention` 即关注页「**最常访问**」（按访问频率）；默认 / `order_type=visit` 才是按**关注时间**，别用错。返回的是**全量关注的名次**（1..N），不是只有前几十个。
 - 用户资料：`GET x/web-interface/card?mid=`、`GET x/space/upstat?mid=`（免登录）。
 - 投稿列表：`GET x/space/wbi/arc/search`，**需要 wbi 签名**（`nav` → `img_key/sub_key` 按 Mixin 表重排取前 32 位 → `md5(sorted_query + wts + key)`），实测**必须带登录 Cookie**，否则 `-352`。
 - 取关：`POST x/relation/modify`，表单 `fid / act=2 / re_src=11 / csrf=<bili_jct>`。
@@ -159,11 +172,12 @@ python build_selector.py         # 已成功取关的自动从清单/页面剔�
 | 文件 | 来源 | 内容 |
 |---|---|---|
 | `cookie.txt` | 提取/用户提供 | 登录 Cookie（敏感） |
-| `following.json/.csv` | fetch_following.py | 全量关注 |
+| `following.json/.csv` | fetch_following.py | 全量关注（含 `visit_rank` 最常访问名次） |
 | `following_videos.json` | fetch_videos.py | 每人近期投稿标题 |
 | `labels_XX.json` | 打标（推荐 subagent） | 内容定位标签 |
 | `combined.json` | build_selector.py | 合并后的主数据 |
 | `selector.html` | build_selector.py | 勾选网页 |
+| `map.html` | visualize.py | 关注图谱与清理过场，内嵌数据和勾选页面 |
 | `analyze_out_XX.json` | 分类（推荐 subagent） | 类型/优先级 |
 | `unfollow.txt` | 用户/网页导出 | 待取关 mid 列表 |
 | `unfollow_log.json` | unfollow.py | 取关结果 |
