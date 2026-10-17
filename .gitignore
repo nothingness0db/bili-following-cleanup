@@ -20,7 +20,10 @@ chunks/
 chunks_analysis/
 selector.html
 map.html
+recap_insight.json
+recap_feature.json
 .preview/
+.avatar-cache/
 
 # --- Python ---
 __pycache__/

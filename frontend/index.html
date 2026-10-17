@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#fafaf8">
+<title>关注的形状 · B 站兴趣图谱</title>
+<link rel="stylesheet" href="style.css">
+<link id="dark-theme" rel="stylesheet" href="theme-dark.css" media="(prefers-color-scheme: dark)">
+</head>
+<body>
+<div id="experience">
+<section id="graph-stage" aria-label="关注图谱">
+<main id="app">
+  <canvas id="universe" aria-label="关注兴趣图谱；可拖动画面、滚轮缩放，也可通过兴趣列表和搜索探索 UP 主"></canvas>
+  <header class="topbar chrome">
+    <div class="top-actions"><select id="appearance" aria-label="外观"><option value="auto">跟随系统</option><option value="light">浅色</option><option value="dark">深色</option></select><label class="file-button">导入关注数据<input id="file" type="file" accept=".json,application/json"></label><button id="save" class="save-button">保存这张图 <span>↗</span></button></div>
+  </header>
+  <section class="intro chrome">
+    <h1>关注图谱</h1>
+    <div class="view-switch" role="group" aria-label="图谱形态"><button data-view="brain" aria-pressed="true">脑回路</button><button data-view="galaxy" aria-pressed="false">兴趣星系</button></div>
+  </section>
+  <section id="recap" class="recap chrome" aria-label="关注速写" hidden>
+    <div class="recap-meta"><span id="recap-step"></span><button id="recap-skip" aria-label="跳过开场">跳过</button></div>
+    <button id="recap-open" class="recap-content" aria-live="polite"><span id="recap-kicker"></span><strong id="recap-title"></strong><span id="recap-detail"></span><small id="recap-note"></small></button>
+    <div id="recap-meter" class="recap-meter" aria-hidden="true"></div>
+  </section>
+  <span id="recap-beacon" class="recap-beacon" hidden aria-hidden="true"></span>
+  <button id="spotlight" class="spotlight" aria-label="查看开场 UP 主" hidden>
+    <span id="spotlight-rank" class="spotlight-rank"></span>
+    <span class="spotlight-avatar"><img id="spotlight-image" alt="" referrerpolicy="no-referrer" decoding="async" hidden><span id="spotlight-initials" aria-hidden="true"></span></span>
+    <strong id="spotlight-name"></strong><span id="spotlight-label"></span>
+  </button>
+  <aside class="interest-panel chrome" aria-label="兴趣构成">
+    <div class="section-label"><span>兴趣构成</span><span id="topic-count">—</span></div>
+    <div id="interests"></div><div class="interest-note">按内容标签归类</div>
+    <button id="wander" class="wander"><span>随机查看 UP 主</span><span>↗</span></button>
+  </aside>
+  <section class="detail chrome" id="detail" hidden aria-label="选中节点详情"><button id="close-detail" class="close-button" aria-label="关闭详情">×</button><div id="detail-content"></div></section>
+  <div class="search-panel chrome"><label class="search-box"><span aria-hidden="true">⌕</span><input id="search" type="search" placeholder="寻找 UP 主 / 兴趣标签" aria-label="搜索 UP 主或兴趣标签"><kbd>/</kbd></label><div id="results" hidden></div></div>
+  <footer class="bottom chrome">
+    <div class="metrics"><div><strong id="account-total">—</strong><span>个 UP 主</span></div><span class="metric-divider"></span><div><strong id="tag-total">—</strong><span>个标签</span></div></div>
+    <div class="map-controls"><button id="recap-replay" aria-label="重播关注速写" title="重播开场">↻</button><div class="control-group"><button id="zoom-out" aria-label="缩小">−</button><button id="fit" aria-label="回到全景">⌖</button><button id="zoom-in" aria-label="放大">＋</button></div><button id="clean" class="clean-button">纯净画面 ⤢</button></div>
+  </footer>
+  <button id="exit-clean" hidden>退出纯净画面 ↙</button><div id="hover-tip" hidden></div><div id="toast" role="status" aria-live="polite"></div>
+  <dialog id="export-dialog"><button class="close-button" id="close-export" aria-label="关闭">×</button><h2>导出图谱</h2><p>PNG · 2400 × 1600</p><label class="export-check"><input type="checkbox" id="export-names">显示 UP 主名字</label><button id="download" class="primary">保存图片</button></dialog>
+</main>
+<a id="cleanup" class="edge-launch" href="__SELECTOR_URL__" aria-label="开始清理，可点击或向左拖动" data-selector-ready="pending" hidden>
+  <span class="edge-grip" aria-hidden="true"><span class="edge-arrow">←</span></span>
+  <span class="edge-label">开始<br>清理</span>
+  <span class="edge-cue" aria-hidden="true">向左拉动</span>
+</a>
+</section>
+<section id="cleanup-stage" aria-label="关注清理" hidden inert>
+  <header class="cleanup-toolbar"><button id="back-to-map">← 返回图谱</button><span>整理关注</span></header>
+  <iframe id="cleanup-frame" title="关注清理列表" referrerpolicy="no-referrer"></iframe>
+</section>
+<section id="passage" aria-label="清理过场" hidden>
+  <div class="passage-content"><div class="passage-voice">意志<span>成功</span></div><p id="passage-quote">这些关注，曾经都属于你。<br><span>但你不必把它们全部带走。</span></p></div>
+  <button id="skip-passage" aria-describedby="passage-quote">继续 →</button>
+  <p id="passage-status" role="status" aria-live="polite"></p>
+  <a id="cleanup-fallback" href="__SELECTOR_URL__" hidden>直接打开清理页 ↗</a>
+</section>
+</div>
+<script id="selector-document" type="application/json">null</script>
+<script id="recap-feature" type="application/json">null</script>
+<script src="recap.js" defer></script>
+<script src="app.js" defer></script>
+</body>
+</html>
