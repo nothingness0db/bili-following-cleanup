@@ -107,7 +107,7 @@ def reset():
 
 
 def unpause():
-    sql("UPDATE gate SET paused='', until_at=0, next_at=0 WHERE id=1")
+    sql("UPDATE gates SET paused='', until_at=0, next_at=0 WHERE lane='account'")
 
 
 def run(fn, *args, **kwargs):
@@ -136,7 +136,7 @@ def main():
             return Response({"code": 0})
 
     check("正常请求返回数据", bili_read.get_json(Ok(), "u")["code"] == 0)
-    left = sql("SELECT next_at FROM gate").fetchone()[0] - time.time()
+    left = sql("SELECT next_at FROM gates WHERE lane='account'").fetchone()[0] - time.time()
     check("成功后排下一次请求 3–6 秒后", 2.9 <= left <= 6.05, f"next in {left:.1f}s")
 
     class Risk:
@@ -145,18 +145,18 @@ def main():
 
     _, err = run(bili_read.get_json, Risk(), "u")
     check("-352 抛 RiskControlError", err is not None and "code=-352" in err, err)
-    paused = sql("SELECT paused FROM gate").fetchone()[0]
+    paused = sql("SELECT paused FROM gates WHERE lane='account'").fetchone()[0]
     check("闸门被暂停", bool(paused), paused)
 
-    until = sql("SELECT until_at FROM gate").fetchone()[0] - time.time()
+    until = sql("SELECT until_at FROM gates WHERE lane='account'").fetchone()[0] - time.time()
     check("冷却 30 分钟", 1790 <= until <= 1805, f"{until:.0f}s")
 
-    _, err = run(bili_read.resume)
-    check("冷却期内 --resume 被拒绝", err is not None and "尚未结束" in err, err)
+    notes = bili_read.resume()
+    check("冷却期内 --resume 被拒绝", any("还要等" in n for n in notes), notes)
 
-    sql("UPDATE gate SET until_at=0 WHERE id=1")
+    sql("UPDATE gates SET until_at=0 WHERE lane='account'")
     bili_read.resume()
-    check("冷却结束后可以 resume", sql("SELECT paused FROM gate").fetchone()[0] == "")
+    check("冷却结束后可以 resume", sql("SELECT paused FROM gates WHERE lane='account'").fetchone()[0] == "")
 
     class Http412:
         def get(self, *a, **k):
@@ -164,6 +164,42 @@ def main():
 
     _, err = run(bili_read.get_json, Http412(), "u")
     check("HTTP 412 也当风控", err is not None and "412" in err, err)
+
+    # ================================================= 分车道熔断
+    print("[1b] 分车道：匿名侧被限流不连累账号侧")
+    reset()
+
+    class AnonRisk:
+        def get(self, *a, **k):
+            return Response({"code": -352})
+
+    _, err = run(bili_read.get_json, AnonRisk(), "u", lane="anon")
+    check("匿名侧撞风控被暂停", "-352" in (err or ""), err)
+    check("匿名侧状态为暂停", sql("SELECT paused FROM gates WHERE lane='anon'").fetchone()[0] != "")
+    check("账号侧没被牵连", sql("SELECT paused FROM gates WHERE lane='account'").fetchone()[0] == "")
+    check("账号侧照常能请求", bili_read.get_json(Ok(), "u")["code"] == 0)
+    sql("UPDATE gates SET until_at=0 WHERE lane='anon'")
+    check("可以只解除匿名侧", any("已解除" in n for n in bili_read.resume("anon")),
+          bili_read.resume("anon"))
+
+    _, err = run(bili_read.get_json, AnonRisk(), "u")
+    check("账号侧撞风控仍然暂停账号侧", sql("SELECT paused FROM gates WHERE lane='account'").fetchone()[0] != "")
+    sql("UPDATE gates SET paused='' WHERE lane='anon'")
+    sql("UPDATE gates SET paused='', until_at=0 WHERE lane='account'")
+    check("账号侧暂停不牵连匿名侧", sql("SELECT paused FROM gates WHERE lane='anon'").fetchone()[0] == "")
+
+    print("[1c] 旧版全局 gate 记录迁移到 account 车道")
+    for path in WORK.glob("state.sqlite3*"):
+        path.unlink()
+    import sqlite3 as sq
+    legacy = sq.connect(bili_read.STATE_FILE, isolation_level=None)
+    legacy.execute("CREATE TABLE gate (id INTEGER PRIMARY KEY, next_at REAL, paused TEXT, until_at REAL)")
+    legacy.execute("INSERT INTO gate VALUES (1, 0, '旧的风控', 0)")
+    legacy.close()
+    bili_read.connection().close()
+    check("旧暂停状态落到 account 车道",
+          sql("SELECT paused FROM gates WHERE lane='account'").fetchone()[0] == "旧的风控")
+    check("旧表已删除", not sql("SELECT name FROM sqlite_master WHERE type='table' AND name='gate'"))
 
     # ================================================= 缓存
     print("[2] 缓存：命中与过期")
@@ -185,7 +221,7 @@ def main():
 
     calls, state = [], {"n": 0}
 
-    def fake_videos(client, url, params=None):
+    def fake_videos(client, url, params=None, **kwargs):
         if url.endswith("nav"):
             return {"code": 0, "data": {"wbi_img": {"img_url": "https://i0/x/" + "a" * 32 + ".png",
                                                     "sub_url": "https://i0/x/" + "b" * 32 + ".png"}}}
@@ -221,7 +257,7 @@ def main():
                                                               "level_info": {"current_level": 3}}}})
     urls = []
 
-    def fake_fans(client, url, params=None):
+    def fake_fans(client, url, params=None, **kwargs):
         urls.append(url)
         return {"code": 0, "data": {"archive": {"view": 42}, "likes": 7}}
 
@@ -238,7 +274,7 @@ def main():
     fetch_following.COOKIE_FILE = WORK / "cookie.txt"
     pages = []
 
-    def fake_following(client, url, params=None):
+    def fake_following(client, url, params=None, **kwargs):
         if url.endswith("nav"):
             return {"code": 0, "data": {"isLogin": True, "mid": 999}}
         pages.append(params["pn"])
@@ -255,7 +291,7 @@ def main():
     unpause()
     pages.clear()
 
-    def fake_following_ok(client, url, params=None):
+    def fake_following_ok(client, url, params=None, **kwargs):
         if url.endswith("nav"):
             return {"code": 0, "data": {"isLogin": True, "mid": 999}}
         pages.append(params["pn"])
@@ -283,8 +319,8 @@ def main():
     check("第 2 个中招 → 整批停", "风控" in stopped and client.calls == ["0", "1"], f"{stopped} / calls={client.calls}")
     rows = json.loads(log.read_text(encoding="utf-8"))
     check("日志落盘、已成功的不丢", [r["ok"] for r in rows] == [True, False], [r["ok"] for r in rows])
-    check("写侧风控同样暂停全局闸门",
-          bool(sql("SELECT paused FROM gate").fetchone()[0]))
+    check("写侧风控暂停 account 车道",
+          bool(sql("SELECT paused FROM gates WHERE lane='account'").fetchone()[0]))
 
     client = PostClient()
     count, stopped = bili_write.run(client, "jct", list(range(60)), names, log)

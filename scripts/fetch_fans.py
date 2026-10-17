@@ -18,14 +18,14 @@ def fetch(client, mid, hits):
     """两个接口各自按 mid 缓存：半个 mid 做完也能续着补另一半个。"""
     card = bili_read.cached("card", mid)
     if card is None:
-        card = bili_read.get_json(client, CARD_URL, {"mid": mid, "photo": "false"})
+        card = bili_read.get_json(client, CARD_URL, {"mid": mid, "photo": "false"}, lane="anon")
         bili_read.store("card", mid, card)
     else:
         hits[0] += 1
 
     up = bili_read.cached("upstat", mid)
     if up is None:
-        up = bili_read.get_json(client, UPSTAT_URL, {"mid": mid})
+        up = bili_read.get_json(client, UPSTAT_URL, {"mid": mid}, lane="anon")
         bili_read.store("upstat", mid, up)
     else:
         hits[1] += 1

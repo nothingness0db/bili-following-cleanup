@@ -28,21 +28,35 @@
 
 ## 串行、断路与断点续抓
 
-**所有联网请求串行、低频**：`fetch_following.py` / `fetch_videos.py` / `fetch_fans.py` / `unfollow.py` / `retry_unfollow.py` 都走同一个闸门（`bili_read.py` + `bili_write.py`，共用一份 sqlite 状态）。**不会**用多线程并发——并发（`max_workers=4`）是实测触发 `-352` 的原因。
+**所有联网请求串行**：`fetch_*.py` / `unfollow.py` / `retry_unfollow.py` 都走同一个闸门（`bili_read.py` + `bili_write.py`，共用一份 sqlite 状态）。**不会**用多线程并发——并发（`max_workers=4`）是实测触发 `-352` 的原因。
 
-| | 读（采集） | 写（取关） |
+闸门分两条车道，区别不在快慢，而在**风控后果落在谁头上**：
+
+| | `account` 车道（带 Cookie） | `anon` 车道（不带 Cookie） |
 |---|---|---|
-| 间隔 | 3–6 秒 | 8–15 秒 |
-| 单批上限 | 不限（慢就是保护） | 50 个/次脚本 |
-| 每日上限 | — | 100 个（跨批次累计） |
-| 撞风控 | 立即整批停、暂停 30 分钟 | 同左，读写共用同一个暂停 |
+| 谁走这条 | `fetch_following` / `fetch_videos` / 全部取关 | `fetch_fans`（`card` + `upstat` 公开接口） |
+| 间隔 | 读 3–6 秒；写 8–15 秒 | 1–2 秒 |
+| 撞风控后果 | **扣账号**，可能连带影响取关、评论 | 扣本机 IP，通常过一阵自动恢复，不动账号 |
+| 冷却 | 30 分钟 | 10 分钟 |
+| 互相牵连 | 独立暂停状态，谁也不连带谁 | 同左 |
+| 单批上限 | 取关 50 个/次脚本 | 不限 |
+| 每日上限 | 取关 100 个（跨批次累计） | — |
 
-一旦遇到风控信号（`-352` / `-412` / `HTTP 403·412·429` / 消息含「风控·频繁·访问受限」），脚本会**立即停掉整批**、把**已拿到的部分原子落盘**、并**暂停 30 分钟**。之后：
+匿名侧能快多少是**实测**出来的，不是猜的（`python probe.py`，23 个匿名请求逐档加速）：
+
+```
+card    间隔 1.5s → 1.0 → 0.7 → 0.5 → 0.3 → 0.2s   全过（中位延迟 60–90ms）
+upstat  间隔 1.5s → 1.0 → 0.7 → 0.5 → 0.3 → 0.2s   全过（中位延迟 55–98ms）
+```
+
+实测到 0.2 秒都没被挡，但闸门只取 **1–2 秒**（留 5–10 倍余量）——爆量测试说明不了「一天能抽多少」。账号侧**没有**做这类压测：那要真的拿 SESSDATA 去打，风险落在账号上，不值得为跑分冒险。
+
+一旦遇到风控信号（`-352` / `-412` / `HTTP 403·412·429` / 消息含「风控·频繁·访问受限」），脚本会**立即停掉整批**、把**已拿到的部分原子落盘**、并**暂停对应车道**。之后：
 
 - **等**，不要重试 / 换接口 / 改脚本续抓；
 - 先做**离线**的事（打标、分类、`build_selector.py`、`visualize.py`，都不发请求）；
-- `python bili_read.py` 看闸门状态与今日已取关数（只读本地，不发请求）；
-- 冷却结束后 `python bili_read.py --resume` 解除本地暂停，再重跑对应脚本。
+- `python bili_read.py` 看两条车道状态与今日已取关数（只读本地，不发请求）；
+- 冷却结束后 `python bili_read.py --resume`（或只解一条：`--resume anon`）再重跑对应脚本。
 
 **不用从头再来**：成功的响应按 key 缓存在本地（`scripts/.bili-read-state.sqlite3`，已在 `.gitignore` 里）。
 
@@ -121,15 +135,16 @@ bili-following-cleanup/
 ├─ .gitignore                    # 忽略 cookie.txt 与所有数据文件
 └─ scripts/
    ├─ extract_cookie_firefox.py  # 从 Firefox 提取 Cookie
-   ├─ bili_read.py               # 闸门：读 3–6s / 写 8–15s、全局熔断、响应缓存（--resume / --forget-cache）
+   ├─ bili_read.py               # 闸门：account 车道 3–6s / anon 车道 1–2s、分车道熔断、响应缓存
    ├─ bili_write.py              # 取关写路径：批上限 50、日上限 100、撞风控整批停
    ├─ fetch_following.py         # 拉全量关注（串行，按页缓存续抓）
    ├─ fetch_videos.py            # 抓每人近期投稿（串行，wbi 签名，按 mid 缓存续抓）
-   ├─ fetch_fans.py              # 补粉丝/等级/播放（串行，免登录，按 mid 缓存续抓）
+   ├─ fetch_fans.py              # 补粉丝/等级/播放（anon 车道，免登录，按 mid 缓存续抓）
    ├─ split_chunks.py            # 切块供打标（推荐 subagent）
    ├─ analyze_split.py           # 切块供分类（推荐 subagent）
    ├─ build_selector.py          # 合并 + 生成 selector.html
    ├─ selftest.py                # 离线自检：不联网跑完闸门/缓存/取关的全部行为
+   ├─ probe.py                   # 匿名接口速率探针（不带 Cookie，只影响本机 IP）
    ├─ unfollow.py                # 批量取关
    └─ retry_unfollow.py          # 补做剩下的（与 unfollow.py 同节奏，不额外重试）
 ```

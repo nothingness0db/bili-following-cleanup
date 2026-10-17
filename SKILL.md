@@ -47,7 +47,7 @@ description: Review and clean up a Bilibili (B站) following list end-to-end —
 
 拿到 Cookie 后，agent 应**连续跑完全部步骤**，中途不停下来问「要不要继续」。**唯一的停顿点**是第 6 步「用户勾选」。凡可拆块**本地分析**的环节（打标 / 分类），**同时开一批 subagent**，不要一个个串行。
 
-> **所有联网请求一律串行、低频。** 采集（`fetch_following.py` / `fetch_videos.py` / `fetch_fans.py`）读 3–6 秒一次，取关（`unfollow.py` / `retry_unfollow.py`）写 8–15 秒一次，全部走同一个闸门（`bili_read.py` + `bili_write.py`）、共用一个熔断状态。**不要**为了提速改回多线程 / 提高并发——那正是触发 `-352` 的原因。**并行只用于本地分析（打标 / 分类），不用于打接口。**
+> **所有联网请求一律串行。** 闸门分两条车道：带 Cookie 的（`fetch_following` / `fetch_videos` / 全部取关）间隔 3–6 秒、冷却 30 分钟，因为风控扣的是**账号**；免登录的 `fetch_fans` 走 anon 车道，1–2 秒、冷却 10 分钟，风控只扣本机 IP。全部走同一个闸门（`bili_read.py` + `bili_write.py`）。**不要**为了提速改回多线程 / 提高并发——那正是触发 `-352` 的原因。**并行只用于本地分析（打标 / 分类），不用于打接口。**
 >
 > 遇风控时脚本会**立即停掉整批**并保存已拿到的进度，不会自动重试、不会换接口续抓。成功的响应会缓存，重跑只补剩下的部分。处置办法见「遇风控怎么办」。
 
@@ -133,7 +133,7 @@ python analyze_split.py          # -> chunks_analysis/aXX.json
 
 ### 5. 补粉丝量（不可跳过）
 ```
-python fetch_fans.py             # 串行低频（走 bili_read）免登录：card 取粉丝/等级，upstat 取播放/点赞 -> 写入 combined.json
+python fetch_fans.py             # anon 车道 1–2s（免登录）：card 取粉丝/等级，upstat 取播放/点赞 -> 写入 combined.json
 python build_selector.py         # 合并分析 + 粉丝 -> 最终 selector.html
 ```
 页面显示 `粉丝 · Lv · 停更天数`，并支持「按粉丝」排序——用于处理「信息重复」：同内容里保粉丝多的、清少的。
@@ -206,11 +206,22 @@ python build_selector.py         # 已成功取关的自动从清单/页面剔�
 
 ## 遇风控怎么办
 
-`bili_read.py` 是**所有联网请求**的统一闸门：**单线程串行 + 读 3–6 秒 / 写 8–15 秒 + 全局熔断**（`fetch_*.py`、`unfollow.py`、`retry_unfollow.py` 共用同一个 sqlite 状态，通过 `bili_write.py` 走同一条闸门）。任何一次请求一旦碰到风控信号（`code=-352` / `-412`、`HTTP 403/412/429`，或消息含「风控 / 频繁 / 访问受限」），会：
+`bili_read.py` 是**所有联网请求**的统一闸门：**单线程串行 + 分车道限速 + 分车道熔断**（`fetch_*.py`、`unfollow.py`、`retry_unfollow.py` 共用同一个 sqlite 状态，通过 `bili_write.py` 走同一条闸门）。
+
+车道按**风控后果落在谁头上**划分，不按快慢：
+
+| 车道 | 谁走 | 间隔 | 冷却 | 被扣的是 |
+|---|---|---|---|---|
+| `account` | `fetch_following` / `fetch_videos` / 全部取关 | 读 3–6s、写 8–15s | 30 分钟 | **账号** |
+| `anon` | `fetch_fans`（`card` + `upstat` 公开接口） | 1–2s | 10 分钟 | 本机 IP，通常自动恢复 |
+
+匿名侧 1–2 秒是实测来的（`python probe.py`：`card` / `upstat` 在 0.2 秒间隔 ×23 个请求仍全过，闸门取 5–10 倍余量）。账号侧**不做**这类压测——那要真的拿 SESSDATA 去打，风险落在账号上。
+
+任何一次请求一旦碰到风控信号（`code=-352` / `-412`、`HTTP 403/412/429`，或消息含「风控 / 频繁 / 访问受限」），会：
 
 1. **立刻停掉整个批次**，不再动后面的账号；
 2. 把**已拿到的部分原子落盘**（`save_json`），本地打标 / 分类 / 出页面都能继续用这部分；
-3. 把闸门**暂停 30 分钟**并打印原因——采集与取关一起被挡住。
+3. 把**该车道**暂停（account 30 分钟 / anon 10 分钟）并打印原因。两条车道互不牵连，所以匿名侧被限流不会挡住取关。
 
 **已拿到的不会白费**：成功的响应按 key 缓存在 `scripts/.bili-read-state.sqlite3`（已 gitignore）。
 
@@ -222,19 +233,20 @@ python build_selector.py         # 已成功取关的自动从清单/页面剔�
 
 - **等。** 不重试、不换接口、不改脚本去补抓、不试探——这些都是绕过熔断，只会更糟。
 - **做离线的事**：拿已落盘的数据跑打标 / 分类 / `build_selector.py` / `visualize.py`（全程不发请求）。
-- 查闸门状态与今日已取关数：`python bili_read.py`（只读本地，不发请求）。
-- 冷却结束后，`python bili_read.py --resume` 再重跑对应脚本——**只补剩下的部分**，不用从头再来。
+- 查两条车道状态与今日已取关数：`python bili_read.py`（只读本地，不发请求）。
+- 冷却结束后，`python bili_read.py --resume`（只解一条：`--resume anon`）再重跑对应脚本——**只补剩下的部分**，不用从头再来。
 - `--resume` 只解除「本地暂停」，**不代表平台已放过**，仍需维持低频。
 - 要强制重抓某类数据：`python bili_read.py --forget-cache videos`（不带 scope 全清）。
 
-> 铁律：联网请求**只走串行低频**，并发（如 `max_workers=4`）正是实测触发 `-352` 的原因；出问题就**停**、就**等**。并行仅用于本地分析（打标 / 分类）。
+> 铁律：联网请求**只走串行**，并发（如 `max_workers=4`）正是实测触发 `-352` 的原因；出问题就**停**、就**等**。并行仅用于本地分析（打标 / 分类）。
 
 ## 自检
 
 ```
-python selftest.py               # 离线跑：不联网、不真等，30+ 项断言，退出码 0 = 全通过
+python selftest.py               # 离线跑：不联网、不真等，40 项断言，退出码 0 = 全通过
+python probe.py                  # 可选：匿名接口的真实速率探针（不带 Cookie，只影响本机 IP）
 ```
-改了闸门 / 缓存 / 取关脚本之后先跑这个，别拿真账号当测试环境。
+改了闸门 / 缓存 / 取关脚本之后先跑 `selftest.py`，别拿真账号当测试环境。
 
 ## 文件产出速查
 
@@ -245,6 +257,7 @@ python selftest.py               # 离线跑：不联网、不真等，30+ 项�
 | `bili_write.py` | — | 取关写路径：批上限 50、日上限 100、撞风控整批停 |
 | `.bili-read-state.sqlite3` | bili_read.py | 闸门状态与缓存（本地、已 gitignore） |
 | `selftest.py` | — | 离线自检：不联网验证闸门/缓存/取关行为 |
+| `probe.py` | — | 匿名接口速率探针（不带 Cookie，只影响本机 IP） |
 | `following.json/.csv` | fetch_following.py | 全量关注（含 `visit_rank` 最常访问名次） |
 | `following_videos.json` | fetch_videos.py | 每人近期投稿标题 |
 | `labels_XX.json` | 打标（推荐 subagent） | 内容定位标签 |

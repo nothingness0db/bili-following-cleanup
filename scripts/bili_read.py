@@ -1,10 +1,15 @@
-"""B站接口的统一闸门：串行限速 + 全局熔断 + 成功响应缓存。
+"""B站接口的统一闸门：分车道限速 + 分车道熔断 + 成功响应缓存。
 
-- 读（GET）每次请求间隔 3–6 秒，写（POST）8–15 秒，全部单线程串行。
-- 所有脚本共用同一个 sqlite 闸门：任一脚本撞上风控，整批立刻停手并全部暂停 30 分钟。
-- 撞上风控就**只停不重试**：不换接口、不换 UA、不缩短间隔去试探。
-- 成功的响应按 key 缓存（投稿按 mid、粉丝按 mid、关注列表按页），重跑时只补还没抓到的
-  部分，不会因为中途中断而从头再来。
+两条车道的区别不是「快慢」，而是**风控后果落在谁头上**：
+
+- `account` 车道（带 Cookie）：`fetch_following` / `fetch_videos` / `unfollow`。
+  被 -352 扣的是账号，可能连带影响取关、评论等，所以最保守：读 3–6 秒、写 8–15 秒，
+  冷却 30 分钟。
+- `anon` 车道（不带 Cookie）：`fetch_fans` 的 card / upstat 两个公开接口。
+  被扣的是本机 IP，通常过一阵自动恢复，不动账号，所以可以快一些：1–2 秒，冷却 10 分钟。
+
+两条车道各有独立暂停状态：匿名侧被限流不会连带停掉账号侧的操作，反之亦然。
+成功的响应按 key 缓存，中断后重跑只补缺的部分。
 """
 import argparse
 import json
@@ -18,11 +23,19 @@ import httpx
 
 STATE_FILE = Path(__file__).resolve().parent / ".bili-read-state.sqlite3"
 
-MIN_INTERVAL = 3.0
-MAX_INTERVAL = 6.0
+LANES = ("account", "anon")
+
+# 车道参数：low/high 是每次请求后的间隔，cooldown 是被风控后的冷却
+LANE_RULES = {
+    "account": {"low": 3.0, "high": 6.0, "cooldown": 30 * 60},
+    "anon": {"low": 1.0, "high": 2.0, "cooldown": 10 * 60},
+}
+
+MIN_INTERVAL = LANE_RULES["account"]["low"]      # 兼容旧引用
+MAX_INTERVAL = LANE_RULES["account"]["high"]
 WRITE_MIN_INTERVAL = 8.0
 WRITE_MAX_INTERVAL = 15.0
-MIN_COOLDOWN = 30 * 60
+MIN_COOLDOWN = LANE_RULES["account"]["cooldown"]
 
 CACHE_TTL = 24 * 60 * 60   # 投稿 / 粉丝：一天内算新鲜
 PAGE_TTL = 60 * 60         # 关注列表分页：一小时，避免翻页期间列表变化
@@ -53,8 +66,19 @@ class BudgetError(RuntimeError):
 
 def connection():
     db = sqlite3.connect(STATE_FILE, timeout=60, isolation_level=None)
-    db.execute("CREATE TABLE IF NOT EXISTS gate (id INTEGER PRIMARY KEY, next_at REAL, paused TEXT, until_at REAL)")
-    db.execute("INSERT OR IGNORE INTO gate VALUES (1, 0, '', 0)")
+    db.execute("CREATE TABLE IF NOT EXISTS gates "
+               "(lane TEXT PRIMARY KEY, next_at REAL, paused TEXT, until_at REAL)")
+    for lane in LANES:
+        db.execute("INSERT OR IGNORE INTO gates VALUES (?, 0, '', 0)", (lane,))
+    # 旧版本只有一条全局 gate 记录：把它的暂停状态迁移到 account 车道后丢掉旧表。
+    legacy = db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='gate'").fetchone()
+    if legacy:
+        row = db.execute("SELECT next_at, paused, until_at FROM gate WHERE id=1").fetchone()
+        if row:
+            next_at, paused, until_at = row
+            db.execute("UPDATE gates SET next_at=?, paused=?, until_at=? WHERE lane='account'",
+                       (next_at or 0, paused or "", until_at or 0))
+        db.execute("DROP TABLE gate")
     db.execute("CREATE TABLE IF NOT EXISTS cache (scope TEXT, key TEXT, body TEXT, at REAL, PRIMARY KEY (scope, key))")
     db.execute("CREATE TABLE IF NOT EXISTS counter (day TEXT, kind TEXT, n INTEGER, PRIMARY KEY (day, kind))")
     return db
@@ -132,20 +156,25 @@ def used(kind):
 # ---------------------------------------------------------------- 闸门
 
 
-def _pause(db, reason):
-    db.execute("UPDATE gate SET paused=?, until_at=? WHERE id=1", (reason, time.time() + MIN_COOLDOWN))
+def _pause(db, lane, reason):
+    rule = LANE_RULES[lane]
+    db.execute("UPDATE gates SET paused=?, until_at=? WHERE lane=?",
+               (reason, time.time() + rule["cooldown"], lane))
 
 
-def _call(client, send, low, high, raise_on_business, counter=None, daily_max=None):
+def _call(client, send, lane, low, high, raise_on_business, counter=None, daily_max=None):
+    rule = LANE_RULES[lane]
     db = connection()
     data = None
     ok = False
     try:
-        # 整个请求期间持有写锁：多个脚本不可能同时打接口。
+        # 整个请求期间持有写锁：同一车道内多个脚本不可能同时打接口。
         db.execute("BEGIN IMMEDIATE")
-        next_at, paused, _ = db.execute("SELECT next_at, paused, until_at FROM gate WHERE id=1").fetchone()
+        next_at, paused, _ = db.execute(
+            "SELECT next_at, paused, until_at FROM gates WHERE lane=?", (lane,)
+        ).fetchone()
         if paused:
-            raise RiskControlError(f"已暂停（{paused}）；不会自动恢复或重试")
+            raise RiskControlError(f"[{lane}] 已暂停（{paused}）；不会自动恢复或重试")
         if counter and daily_max is not None:
             spent = db.execute("SELECT n FROM counter WHERE day=? AND kind=?", (day(), counter)).fetchone()
             spent = spent[0] if spent else 0
@@ -169,15 +198,13 @@ def _call(client, send, low, high, raise_on_business, counter=None, daily_max=No
                 raise ApiError(f"接口 code={data.get('code')}，未重试")
             ok = True
         except RiskControlError as error:
-            _pause(db, str(error))
+            _pause(db, lane, str(error))
             raise
         except (httpx.HTTPError, ValueError) as error:
             raise ApiError(f"请求失败（{type(error).__name__}），未重试") from error
         finally:
-            db.execute(
-                "UPDATE gate SET next_at=? WHERE id=1",
-                (time.time() + random.uniform(low, high),),
-            )
+            db.execute("UPDATE gates SET next_at=? WHERE lane=?",
+                       (time.time() + random.uniform(low, high), lane))
             if ok and counter:
                 db.execute(
                     "INSERT INTO counter (day, kind, n) VALUES (?, ?, 1) "
@@ -190,25 +217,28 @@ def _call(client, send, low, high, raise_on_business, counter=None, daily_max=No
         db.close()
 
 
-def get_json(client, url, params=None, headers=None):
-    """读接口：3–6 秒一次，业务错误码抛 ApiError，风控抛 RiskControlError。"""
+def get_json(client, url, params=None, headers=None, lane="account"):
+    """读接口。lane='anon' 用于不带 Cookie 的公开接口。"""
+    rule = LANE_RULES[lane]
     return _call(
         client,
         lambda: client.get(url, params=params, headers=headers, timeout=20),
-        MIN_INTERVAL,
-        MAX_INTERVAL,
+        lane,
+        rule["low"],
+        rule["high"],
         raise_on_business=True,
     )
 
 
 def post_json(client, url, form=None, headers=None, counter=None, daily_max=DAILY_WRITE_MAX):
-    """写接口：8–15 秒一次，附带每日配额；风控仍然立刻停手。
+    """写接口：固定走 account 车道，8–15 秒一次，附带每日配额。
 
     不对业务错误码抛异常——取关时要拿到 code/message 写日志，由调用方判断。
     """
     return _call(
         client,
         lambda: client.post(url, data=form, headers=headers, timeout=20),
+        "account",
         WRITE_MIN_INTERVAL,
         WRITE_MAX_INTERVAL,
         raise_on_business=False,
@@ -220,49 +250,60 @@ def post_json(client, url, form=None, headers=None, counter=None, daily_max=DAIL
 # ---------------------------------------------------------------- 暂停 / 恢复
 
 
-def pause(reason):
+def pause(reason, lane="account"):
     db = connection()
     try:
         db.execute("BEGIN IMMEDIATE")
-        _pause(db, reason)
+        _pause(db, lane, reason)
         db.commit()
     finally:
         db.close()
 
 
-def resume():
-    """只改本地状态；必须用户明确要求才调用。"""
-    db = connection()
-    try:
-        db.execute("BEGIN IMMEDIATE")
-        until = db.execute("SELECT until_at FROM gate WHERE id=1").fetchone()[0]
-        if time.time() < until:
-            raise RiskControlError("本地最短冷却时间尚未结束；不会请求接口试探恢复")
-        db.execute("UPDATE gate SET paused='', until_at=0 WHERE id=1")
-        db.commit()
-    finally:
-        db.close()
+def resume(lane=None):
+    """只改本地状态；必须用户明确要求才调用。返回每个车道的结果说明。"""
+    lanes = [lane] if lane else list(LANES)
+    notes = []
+    for name in lanes:
+        db = connection()
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            paused, until = db.execute(
+                "SELECT paused, until_at FROM gates WHERE lane=?", (name,)
+            ).fetchone()
+            if not paused:
+                notes.append(f"{name}：本来就没暂停")
+            elif time.time() < until:
+                left = (until - time.time()) / 60
+                notes.append(f"{name}：冷却还没结束，还要等 {left:.0f} 分钟")
+            else:
+                db.execute("UPDATE gates SET paused='', until_at=0 WHERE lane=?", (name,))
+                notes.append(f"{name}：已解除")
+            db.commit()
+        finally:
+            db.close()
+    return notes
 
 
 def status():
     db = connection()
     try:
-        next_at, paused, until = db.execute("SELECT next_at, paused, until_at FROM gate WHERE id=1").fetchone()
+        rows = db.execute("SELECT lane, next_at, paused, until_at FROM gates").fetchall()
     finally:
         db.close()
-    if paused:
-        print(f"采集/操作已暂停：{paused}")
-        print("最早可手动解除：" + datetime.fromtimestamp(until).astimezone().isoformat(timespec="seconds"))
-    else:
-        print("未暂停：读 3–6 秒一次、写 8–15 秒一次，全串行")
-    left = next_at - time.time()
-    if left > 0:
-        print(f"下一次请求最早也要等 {left:.0f} 秒")
+    for lane, next_at, paused, until in rows:
+        rule = LANE_RULES[lane]
+        head = f"[{lane}] 间隔 {rule['low']:.0f}–{rule['high']:.0f}s、冷却 {rule['cooldown'] / 60:.0f} 分钟"
+        if paused:
+            when = datetime.fromtimestamp(until).astimezone().isoformat(timespec="seconds")
+            print(f"{head} —— 已暂停：{paused}（最早 {when} 可手动解除）")
+        else:
+            print(f"{head} —— 未暂停")
+        left = next_at - time.time()
+        if left > 0:
+            print(f"        下一次请求最早也要等 {left:.0f} 秒")
     scopes = cache_stats()
-    if scopes:
-        print("缓存：" + "、".join(f"{scope} {count} 条" for scope, count in sorted(scopes.items())))
-    else:
-        print("缓存：空")
+    print("缓存：" + ("、".join(f"{scope} {count} 条" for scope, count in sorted(scopes.items())) if scopes else "空"))
     print(f"今日写操作：{used('unfollow')} / {DAILY_WRITE_MAX}")
 
 
@@ -279,15 +320,21 @@ def save_json(path, data):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--resume", action="store_true", help="用户明确要求后，解除本地暂停；不发网络请求")
-    parser.add_argument("--forget-cache", nargs="?", const="", metavar="SCOPE", help="丢弃缓存（不指定 scope 则全清），让下次重抓")
+    parser.add_argument("--resume", nargs="?", const="", metavar="LANE",
+                        help="用户明确要求后解除本地暂停；不指定车道则解全部（不发网络请求）")
+    parser.add_argument("--forget-cache", nargs="?", const="", metavar="SCOPE",
+                        help="丢弃缓存（不指定 scope 则全清），让下次重抓")
     args = parser.parse_args()
-    if args.resume:
-        try:
-            resume()
-        except RiskControlError as error:
-            parser.exit(2, str(error) + "\n")
-        print("已解除本地暂停；不代表平台限制已解除，后续仍按低频采集")
+    if args.resume is not None:
+        target = args.resume or None
+        if target and target not in LANES:
+            parser.exit(2, f"车道只能是 {'/'.join(LANES)}\n")
+        notes = resume(target)
+        for note in notes:
+            print(note)
+        if all("还要等" in note for note in notes):
+            parser.exit(2, "本地最短冷却时间尚未结束；不会请求接口试探恢复\n")
+        print("解除的只是本地暂停，不代表平台已放过，仍需维持低频")
     elif args.forget_cache is not None:
         forget(args.forget_cache or None)
         print("缓存已清空：" + (args.forget_cache or "全部"))
