@@ -109,7 +109,7 @@ python retry_unfollow.py         # 8–16s 间隔，-352 退避 25–45s，最�
 - 用户资料：`GET x/web-interface/card?mid=`、`GET x/space/upstat?mid=`（免登录）。
 - 投稿列表：`GET x/space/wbi/arc/search`，**需要 wbi 签名**（`nav` → `img_key/sub_key` 按 Mixin 表重排取前 32 位 → `md5(sorted_query + wts + key)`），实测**必须带登录 Cookie**，否则 `-352`。
 - 取关：`POST x/relation/modify`，表单 `fid / act=2 / re_src=11 / csrf=<bili_jct>`。
-- **风控 -352**：批量取关极易触发且成片出现；控制节奏、失败后等待重试通常能补齐。
+- **风控 -352**：批量取关**可能**成片触发（实测一次 137 个里 26 个中招，另一次 81 个全过）；**放慢节奏**，失败后等待重试通常能补齐。
 - **粘连的 mid**：从聊天/别处复制的列表常把多个 mid 粘成一行（如 `4902922711257000280` = `490292271` + `1257000280`）。导入前必须拆开，并用 `following.json` 校验「不在关注列表」的项。
 - **隐私**：`cookie.txt` 与所有 `*.json` 数据都在 `.gitignore` 里；发布前确认没被 tracked。
 
