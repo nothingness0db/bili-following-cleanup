@@ -14,7 +14,12 @@
 4. **分类打分** —— 按 8 种取关判断给类型 + 优先级（推荐用 subagent 并行）。
 5. **补粉丝量** —— 免登录接口，辅助判断「信息重复」。
 6. **本地网页勾选** —— `selector.html`，搜索/按内容/类型/优先级勾选/导出待取关列表。
-7. **批量取关** —— 带随机延时 + 风控退避与重试。
+7. **独立兴趣图谱** —— `visualize.py` 生成 `map.html`：脑回路 / 兴趣星系 / 兴趣指纹，探索标签与 UP 主，导出高清图片。
+8. **批量取关** —— 带随机延时 + 风控退避与重试。
+
+## 原则：决定权归用户
+
+工具只负责**分类和呈现**，不替用户决定。agent **不会**攒一份「建议取关名单」再问「全部取关行不行」——分类只是给人**自己挑**的参考，取关名单永远来自使用者自己勾选导出。
 
 ## 环境
 
@@ -35,8 +40,9 @@ python fetch_following.py
 python fetch_videos.py
 python split_chunks.py          # 再打标（推荐用 subagent）-> labels_XX.json
 
-# 3) 生成勾选网页
+# 3) 出图：勾选网页 + 关注星图
 python build_selector.py        # 打开 selector.html，勾选后导出 unfollow.txt
+python visualize.py             # 打开 map.html（独立兴趣图谱）
 
 # 4) 取关（先不带 --yes 会二次确认）
 python unfollow.py
@@ -45,6 +51,27 @@ python retry_unfollow.py
 ```
 
 ## 目录
+
+### 关注的形状 · 独立兴趣图谱
+
+这是一层独立的视觉展示，不改变原有筛选、取关脚本和数据。
+
+- **脑回路 / 兴趣星系 / 兴趣指纹**：同一份关注数据在三种形态间平滑变换。
+- **探索**：缩放、平移、拖动节点；点击兴趣分类、标签或 UP 主查看详情；搜索或随机遇见一个账号。
+- **分享**：纯净画面用于录屏，导出 2400 × 1600 PNG。默认不在图片中显示 UP 主名称。
+- **本地运行**：无需安装前端依赖，没有外部请求；支持页面内导入 JSON。无数据时显示 728 个明确标注的虚构演示账号。
+
+```bash
+python scripts/visualize.py
+# 也可指定输入与输出
+python scripts/visualize.py --input path/to/combined.json --output interest-map.html
+```
+
+直接打开生成的 `scripts/map.html`，或打开 `frontend/index.html` 体验演示。前端源文件在 `frontend/`，修改后重新运行生成脚本。
+
+数据兼容现有 `combined.json`：`mid`、`uname`、`label`，可选 `tags`、`sign`、`fans`、`last_days`、`videos`。兴趣大类由内容标签关键词推定；保留原始标签。图谱连线表示账号与标签、标签与兴趣大类，及共享标签的相邻账号；指纹的螺旋线只表示视觉排列。节点位置是视觉布局，不代表实际脑区、人格、观看时间或账号互动。
+
+### 文件结构
 
 ```
 bili-following-cleanup/

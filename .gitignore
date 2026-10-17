@@ -19,6 +19,8 @@ analyze_out_*.json
 chunks/
 chunks_analysis/
 selector.html
+map.html
+.preview/
 
 # --- Python ---
 __pycache__/
