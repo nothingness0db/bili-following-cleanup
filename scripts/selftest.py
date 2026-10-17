@@ -165,8 +165,26 @@ def main():
     _, err = run(bili_read.get_json, Http412(), "u")
     check("HTTP 412 也当风控", err is not None and "412" in err, err)
 
+    # ================================================= 风控码识别
+    print("[1a2] 风控码识别：body 里的 -403 也必须算风控")
+    for code, expect_risk in [(-352, True), (-403, True), (-412, True), (-509, True), (-404, False), (22001, False)]:
+        reset()
+
+        class Coded:
+            def __init__(self, c):
+                self.c = c
+
+            def get(self, *a, **k):
+                return Response({"code": self.c, "message": "" if self.c != -403 else "访问权限不足"})
+
+        _, err = run(bili_read.get_json, Coded(code), "u")
+        paused = sql("SELECT paused FROM gates WHERE lane='account'").fetchone()[0] != ""
+        is_risk = err is not None and err.startswith("RiskControlError")
+        check(f"code={code} -> {'风控' if expect_risk else '普通失败'}", is_risk == expect_risk and paused == expect_risk,
+              f"{err} / 暂停={paused}")
+
     # ================================================= 分车道熔断
-    print("[1b] 分车道：匿名侧被限流不连累账号侧")
+    print("[1b] 风控是 IP 级的：任一侧撞上，两条车道一起停")
     reset()
 
     class AnonRisk:
@@ -176,17 +194,18 @@ def main():
     _, err = run(bili_read.get_json, AnonRisk(), "u", lane="anon")
     check("匿名侧撞风控被暂停", "-352" in (err or ""), err)
     check("匿名侧状态为暂停", sql("SELECT paused FROM gates WHERE lane='anon'").fetchone()[0] != "")
-    check("账号侧没被牵连", sql("SELECT paused FROM gates WHERE lane='account'").fetchone()[0] == "")
-    check("账号侧照常能请求", bili_read.get_json(Ok(), "u")["code"] == 0)
-    sql("UPDATE gates SET until_at=0 WHERE lane='anon'")
+    check("账号侧也被连带暂停（同一出口）",
+          sql("SELECT paused FROM gates WHERE lane='account'").fetchone()[0] != "")
+    _, err = run(bili_read.get_json, Ok(), "u")
+    check("被连带后账号侧也确实发不出去", err is not None and "已暂停" in err, err)
+
+    sql("UPDATE gates SET until_at=0")
     check("可以只解除匿名侧", any("已解除" in n for n in bili_read.resume("anon")),
           bili_read.resume("anon"))
-
-    _, err = run(bili_read.get_json, AnonRisk(), "u")
-    check("账号侧撞风控仍然暂停账号侧", sql("SELECT paused FROM gates WHERE lane='account'").fetchone()[0] != "")
-    sql("UPDATE gates SET paused='' WHERE lane='anon'")
-    sql("UPDATE gates SET paused='', until_at=0 WHERE lane='account'")
-    check("账号侧暂停不牵连匿名侧", sql("SELECT paused FROM gates WHERE lane='anon'").fetchone()[0] == "")
+    check("解一条不影响另一条",
+          sql("SELECT paused FROM gates WHERE lane='account'").fetchone()[0] != "")
+    sql("UPDATE gates SET paused='', until_at=0")
+    check("两条都解除后账号侧能请求", bili_read.get_json(Ok(), "u")["code"] == 0)
 
     print("[1c] 旧版全局 gate 记录迁移到 account 车道")
     for path in WORK.glob("state.sqlite3*"):
@@ -329,16 +348,87 @@ def main():
     unpause()
     client = PostClient()
     count, stopped = bili_write.run(client, "jct", list(range(60)), names, log)
-    check("续做时跳过已成功的 0 号", 0 not in client.calls, client.calls[:3])
+    check("续做时跳过已成功的 0 号", "0" not in client.calls, client.calls[:3])
     check("批上限 50", count == 50, count)
-    check("日志按 mid 去重累积", len(json.loads(log.read_text(encoding="utf-8"))) == 51,
+    # 0 成功、1 风控、2 在暂停期被挡 —— 三条各一条，之后 C 段补 50 条
+    check("日志按 mid 去重累积", len(json.loads(log.read_text(encoding="utf-8"))) == 53,
           len(json.loads(log.read_text(encoding="utf-8"))))
-    check("当日计数已累计", bili_read.used("unfollow") == 51, bili_read.used("unfollow"))
+    check("当日计数已累计（含撞风控那次）", bili_read.used("unfollow") == 52, bili_read.used("unfollow"))
 
     sql("UPDATE counter SET n=? WHERE kind='unfollow'", (bili_write.DAILY_MAX,))
     client = PostClient()
     count, stopped = bili_write.run(client, "jct", list(range(60)), names, log)
     check("日上限到了就干净地停", "上限" in stopped and client.calls == [], f"{stopped} / calls={client.calls}")
+
+    # ================================================= 连片失败熔断
+    print("[7] 连片失败熔断：不是「这个号坏了」，是系统性故障")
+    reset()
+    log = WORK / "unfollow_log.json"
+    log.unlink(missing_ok=True)
+    client = PostClient([0] + [-404] * 10)
+    count, stopped = bili_write.run(client, "jct", list(range(20)), names, log)
+    check("连续失败到阈值就停批", "连续" in stopped, stopped)
+    check("没有把 20 个全打出去", len(client.calls) == 1 + bili_read.FAIL_STREAK_LIMIT, len(client.calls))
+    check("并暂停车道", sql("SELECT paused FROM gates WHERE lane='account'").fetchone()[0] != "")
+
+    reset()
+    calls = [0]
+
+    def always_500(client, url, params=None, **kwargs):
+        calls[0] += 1
+        raise bili_read.ApiError("接口 code=-404，未重试")
+
+    bili_read.get_json = always_500
+    fetch_fans.SRC = WORK / "fans_streak.json"
+    fetch_fans.SRC.write_text(json.dumps([{"mid": i, "uname": f"f{i}"} for i in range(20)]), encoding="utf-8")
+    _, err = run(fetch_fans.main)
+    check("读侧连片失败也停批", err is not None and "连续" in err, err)
+    check("不会把 20 个全打完", calls[0] == bili_read.FAIL_STREAK_LIMIT, calls[0])
+    check("读侧连片失败暂停车道", sql("SELECT paused FROM gates WHERE lane='anon'").fetchone()[0] != "")
+
+    # ================================================= 配额与限速参数
+    print("[8] 配额语义与限速参数")
+    reset()
+    bili_write.BATCH_MAX = bili_write.BATCH_MAX  # noqa: 只是明示未改动
+
+    class Boom:
+        def post(self, *a, **k):
+            raise __import__("httpx").HTTPError("connection reset")
+
+    count, stopped = bili_write.run(Boom(), "jct", [1], {}, WORK / "boom.json")
+    check("传输层失败也占用当日配额（否则不是硬上限）", bili_read.used("unfollow") == 1,
+          bili_read.used("unfollow"))
+    check("传输层失败不算风控", stopped == "", stopped)
+
+    check("account 读间隔保持 0.25–0.4", bili_read.READ_INTERVAL["account"] == (0.25, 0.4),
+          bili_read.READ_INTERVAL["account"])
+    check("anon 读间隔保持 0.3–0.5", bili_read.READ_INTERVAL["anon"] == (0.3, 0.5),
+          bili_read.READ_INTERVAL["anon"])
+    check("写间隔保持 8–15（不能被误配成读间隔）",
+          (bili_read.WRITE_MIN_INTERVAL, bili_read.WRITE_MAX_INTERVAL) == (8.0, 15.0),
+          (bili_read.WRITE_MIN_INTERVAL, bili_read.WRITE_MAX_INTERVAL))
+    check("两条车道冷却都是 30 分钟", bili_read.COOLDOWN == {"account": 1800, "anon": 1800}, bili_read.COOLDOWN)
+
+    # ================================================= schema 自愈
+    print("[9] 库停在任何一次建表之间都能自愈")
+    reset()
+    for path in WORK.glob("state.sqlite3*"):
+        path.unlink()
+    partial = __import__("sqlite3").connect(bili_read.STATE_FILE, isolation_level=None)
+    partial.execute("CREATE TABLE gates (lane TEXT PRIMARY KEY, next_at REAL, paused TEXT, until_at REAL)")
+    partial.execute("INSERT INTO gates VALUES ('account', 0, '', 0)")
+    partial.execute("INSERT INTO gates VALUES ('anon', 0, '', 0)")
+    partial.close()   # 只有 gates，没有 cache / counter
+    bili_read.store("videos", "1", {"code": 0})
+    check("缺 cache 表也能写缓存", bili_read.cached("videos", "1") == {"code": 0})
+    db = bili_read.connection()
+    try:
+        db.execute("INSERT INTO counter (day, kind, n) VALUES ('2000-01-01', 'unfollow', 1) "
+                   "ON CONFLICT(day, kind) DO UPDATE SET n = n + 1")
+    finally:
+        db.close()
+    check("缺 counter 表也能写配额", True)
+
 
     # ================================================= 收尾
     for path in sorted(WORK.rglob("*"), reverse=True):

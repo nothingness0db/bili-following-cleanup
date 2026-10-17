@@ -11,11 +11,12 @@
   账号状态而不是读数据，且实测 1.5–3.5 秒串行仍会成片中招；另外还有批上限与日上限。
 
 风控是冷却型、偏 IP 级（bili-sync 实测换凭据无效），所以撞上之后唯一有效的动作是
-「停 + 等」，两条车道各有独立暂停状态，互不牵连；但它们不能并行跑——同一个 sqlite
-文件的写锁是库级的。成功的响应按 key 缓存，中断后重跑只补缺的部分。
+「停 + 等」：任一条车道撞上，两条一起停（同一出口的请求都会中招）。两条车道只是节奏不同，
+不能并行跑——同一个 sqlite 文件的写锁是库级的。成功的响应按 key 缓存，中断后重跑只补缺的部分。
 """
 import argparse
 import json
+import os
 import random
 import sqlite3
 import time
@@ -45,16 +46,20 @@ WRITE_MAX_INTERVAL = 15.0
 # 冷却：风控是 IP 级冷却型的，bili-sync 的观测是 30 分钟～1 小时自解，换凭据无效。
 COOLDOWN = {"account": 30 * 60, "anon": 30 * 60}
 
-MIN_COOLDOWN = COOLDOWN["account"]
-MIN_INTERVAL, MAX_INTERVAL = READ_INTERVAL["account"]   # 兼容旧引用
-
 CACHE_TTL = 24 * 60 * 60   # 投稿 / 粉丝：一天内算新鲜
 PAGE_TTL = 60 * 60         # 关注列表分页：一小时，避免翻页期间列表变化
-DAILY_WRITE_MAX = 100      # 取关这类写操作的每日上限
+DAILY_WRITE_MAX = 100      # 取关这类写操作的每日上限（按「实际发出的请求数」计）
 
-RISK_CODES = (-352, -412)
+# 风控信号。注意 B 站是 HTTP 200 + body 里带 code 的风格，所以 body 里的 code 必须一起认：
+# bili-sync 的 README 明说它的冷却型风控就是「-403 访问权限不足」。少了 -403，
+# 「遇风控整批停」在最典型的风控形态下根本不生效。
+RISK_CODES = (-352, -403, -412, -509)
 RISK_STATUS = (403, 412, 429)
-RISK_WORDS = ("风控", "频繁", "访问受限")
+RISK_WORDS = ("风控", "频繁", "访问受限", "访问权限不足", "请求被拦截", "拒绝访问")
+
+# 连续这么多个业务错误就判定为系统性故障（Cookie 过期 / wbi 失效 / 认不出的风控），
+# 中止本轮并暂停车道，避免按正常速度把剩下几百个号白打一遍。
+FAIL_STREAK_LIMIT = 5
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
@@ -68,30 +73,39 @@ class ApiError(RuntimeError):
     """业务错误码或网络故障：单条跳过，不算风控。"""
 
 
-ApiReadError = ApiError  # 旧名字，保留兼容
-
-
 class BudgetError(RuntimeError):
     """当天的写操作配额已用完（或本批超过上限）。"""
 
 
 def connection():
     db = sqlite3.connect(STATE_FILE, timeout=60, isolation_level=None)
-    db.execute("CREATE TABLE IF NOT EXISTS gates "
-               "(lane TEXT PRIMARY KEY, next_at REAL, paused TEXT, until_at REAL)")
-    for lane in LANES:
-        db.execute("INSERT OR IGNORE INTO gates VALUES (?, 0, '', 0)", (lane,))
-    # 旧版本只有一条全局 gate 记录：把它的暂停状态迁移到 account 车道后丢掉旧表。
-    legacy = db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='gate'").fetchone()
-    if legacy:
+    # 建表只在缺表时做：每次请求都 CREATE TABLE 会抢写锁，采集期间看状态就会卡住。
+    # 但不能只判断一张表——库可能停在任何一次建表之间（升级/中断），那样 cached()
+    # 或配额读写就会撞 no such table。
+    have = {row[0] for row in db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('gates', 'cache', 'counter', 'gate')")}
+    if {"gates", "cache", "counter"} <= have and "gate" not in have:
+        return db
+
+    if "gates" not in have:
+        db.execute("CREATE TABLE IF NOT EXISTS gates "
+                   "(lane TEXT PRIMARY KEY, next_at REAL, paused TEXT, until_at REAL)")
+        for lane in LANES:
+            db.execute("INSERT OR IGNORE INTO gates VALUES (?, 0, '', 0)", (lane,))
+    if "gate" in have:
+        # 旧版本只有一条全局 gate 记录：把它迁到 account 车道（只在该车道未暂停时），再丢表。
         row = db.execute("SELECT next_at, paused, until_at FROM gate WHERE id=1").fetchone()
-        if row:
+        current = db.execute("SELECT paused FROM gates WHERE lane='account'").fetchone()
+        if row and not (current and current[0]):
             next_at, paused, until_at = row
             db.execute("UPDATE gates SET next_at=?, paused=?, until_at=? WHERE lane='account'",
                        (next_at or 0, paused or "", until_at or 0))
         db.execute("DROP TABLE gate")
-    db.execute("CREATE TABLE IF NOT EXISTS cache (scope TEXT, key TEXT, body TEXT, at REAL, PRIMARY KEY (scope, key))")
-    db.execute("CREATE TABLE IF NOT EXISTS counter (day TEXT, kind TEXT, n INTEGER, PRIMARY KEY (day, kind))")
+    if "cache" not in have:
+        db.execute("CREATE TABLE IF NOT EXISTS cache "
+                   "(scope TEXT, key TEXT, body TEXT, at REAL, PRIMARY KEY (scope, key))")
+    if "counter" not in have:
+        db.execute("CREATE TABLE IF NOT EXISTS counter (day TEXT, kind TEXT, n INTEGER, PRIMARY KEY (day, kind))")
     return db
 
 
@@ -139,15 +153,6 @@ def forget(scope=None):
     finally:
         db.close()
 
-
-def cache_stats():
-    db = connection()
-    try:
-        return dict(db.execute("SELECT scope, COUNT(*) FROM cache GROUP BY scope").fetchall())
-    finally:
-        db.close()
-
-
 # ---------------------------------------------------------------- 配额
 
 
@@ -168,14 +173,21 @@ def used(kind):
 
 
 def _pause(db, lane, reason):
+    """撞上风控时的停手。风控是 IP 级的，所以同一出口的另一条车道一并停掉——
+    否则匿名侧被限流时，取关还会继续压在同一个已经过热的 IP 上。"""
+    stamp = time.time() + COOLDOWN[lane]
     db.execute("UPDATE gates SET paused=?, until_at=? WHERE lane=?",
-               (reason, time.time() + COOLDOWN[lane], lane))
+               (f"[{lane}] {reason}", stamp, lane))
+    for other in LANES:
+        if other != lane:
+            db.execute("UPDATE gates SET paused=?, until_at=? WHERE lane=?",
+                       (f"由 {lane} 车道连带暂停：{reason}", stamp, other))
 
 
 def _call(client, send, lane, low, high, raise_on_business, counter=None, daily_max=None):
     db = connection()
     data = None
-    ok = False
+    attempted = False
     try:
         # 整个请求期间持有写锁：同一车道内多个脚本不可能同时打接口。
         db.execute("BEGIN IMMEDIATE")
@@ -193,6 +205,7 @@ def _call(client, send, lane, low, high, raise_on_business, counter=None, daily_
         if delay > 0:
             time.sleep(delay)
         try:
+            attempted = True
             response = send()
             if response.status_code in RISK_STATUS:
                 raise RiskControlError(f"HTTP {response.status_code}")
@@ -202,10 +215,9 @@ def _call(client, send, lane, low, high, raise_on_business, counter=None, daily_
                 raise ApiError("接口返回格式异常，未重试")
             message = str(data.get("message") or data.get("msg") or "")
             if data.get("code") in RISK_CODES or any(word in message for word in RISK_WORDS):
-                raise RiskControlError(f"接口 code={data.get('code')}")
+                raise RiskControlError(f"接口 code={data.get('code')}" + (f"（{message}）" if message else ""))
             if raise_on_business and data.get("code") != 0:
                 raise ApiError(f"接口 code={data.get('code')}，未重试")
-            ok = True
         except RiskControlError as error:
             _pause(db, lane, str(error))
             raise
@@ -214,7 +226,9 @@ def _call(client, send, lane, low, high, raise_on_business, counter=None, daily_
         finally:
             db.execute("UPDATE gates SET next_at=? WHERE lane=?",
                        (time.time() + random.uniform(low, high), lane))
-            if ok and counter:
+            # 只要请求真的发出去了就计数：传输层失败（断连/超时）也算，
+            # 否则「每天最多 100」就不是对平台请求数的硬上限。
+            if attempted and counter:
                 db.execute(
                     "INSERT INTO counter (day, kind, n) VALUES (?, ?, 1) "
                     "ON CONFLICT(day, kind) DO UPDATE SET n = n + 1",
@@ -295,9 +309,15 @@ def resume(lane=None):
 
 
 def status():
-    db = connection()
+    """只读：绝不写库，否则采集进行中调用会被写锁挡到几十秒。"""
+    if not STATE_FILE.exists():
+        print("闸门尚未初始化（还没跑过任何采集或取关）")
+        return
+    db = sqlite3.connect(f"{STATE_FILE.as_uri()}?mode=ro", uri=True, timeout=5)
     try:
         rows = db.execute("SELECT lane, next_at, paused, until_at FROM gates").fetchall()
+        scopes = dict(db.execute("SELECT scope, COUNT(*) FROM cache GROUP BY scope").fetchall())
+        spent = db.execute("SELECT n FROM counter WHERE day=? AND kind=?", (day(), "unfollow")).fetchone()
     finally:
         db.close()
     for lane, next_at, paused, until in rows:
@@ -305,24 +325,28 @@ def status():
         head = f"[{lane}] 读 {low:g}–{high:g}s、冷却 {COOLDOWN[lane] / 60:.0f} 分钟"
         if paused:
             when = datetime.fromtimestamp(until).astimezone().isoformat(timespec="seconds")
-            print(f"{head} —— 已暂停：{paused}（最早 {when} 可手动解除）")
+            print(f"{head} —— 已暂停：{paused}")
+            print(f"        最早 {when} 可手动 --resume（不会自动恢复）")
         else:
             print(f"{head} —— 未暂停")
         left = next_at - time.time()
         if left > 0:
             print(f"        下一次请求最早也要等 {left:.0f} 秒")
-    scopes = cache_stats()
     print("缓存：" + ("、".join(f"{scope} {count} 条" for scope, count in sorted(scopes.items())) if scopes else "空"))
-    print(f"今日写操作：{used('unfollow')} / {DAILY_WRITE_MAX}")
+    print(f"今日写操作（已发出请求数）：{spent[0] if spent else 0} / {DAILY_WRITE_MAX}")
 
 
 # ---------------------------------------------------------------- 工具
 
 
 def save_json(path, data):
-    """原子落盘：先写 .tmp 再替换，中断不会留下半截 JSON。"""
+    """原子落盘：写到唯一的 .tmp 再替换。
+
+    tmp 名带 pid，否则两个进程同时写同一个文件时会在 Windows 上撞
+    PermissionError（同一个 .tmp 被两边打开）。
+    """
     path = Path(path)
-    temporary = path.with_name(path.name + ".tmp")
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     temporary.replace(path)
 

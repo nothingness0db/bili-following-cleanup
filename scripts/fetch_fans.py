@@ -44,13 +44,20 @@ def fetch(client, mid, hits):
 def main():
     rows = json.loads(SRC.read_text(encoding="utf-8"))
     hits = [0, 0]
+    streak = 0
     client = httpx.Client(headers=H, timeout=20)
     try:
         for i, r in enumerate(rows):
             try:
                 r.update(fetch(client, str(r["mid"]), hits))
+                streak = 0
             except bili_read.ApiError as error:
+                streak += 1
                 print(f"  跳过 {r.get('mid')}：{error}")
+                if streak >= bili_read.FAIL_STREAK_LIMIT:
+                    bili_read.pause(f"连续 {streak} 个粉丝请求失败，像系统性故障：{error}", lane="anon")
+                    raise bili_read.RiskControlError(
+                        f"连续 {streak} 个请求失败（不是单个号的问题，可能是被限流或接口改版）")
             if (i + 1) % 50 == 0:
                 print(f"  {i + 1}/{len(rows)}（缓存命中 {hits[0] + hits[1]} 次）")
     except bili_read.RiskControlError as error:

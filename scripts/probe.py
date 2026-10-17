@@ -20,6 +20,8 @@ import time
 
 import httpx
 
+import bili_read
+
 CARD = "https://api.bilibili.com/x/web-interface/card"
 UPSTAT = "https://api.bilibili.com/x/space/upstat"
 
@@ -107,7 +109,14 @@ def main():
     if tripped:
         interval, outcome = tripped
         print(f"被挡在第一档：间隔 {interval}s（{outcome}）")
-        print("结论：匿名请求一样会被 -352 挡，只是后果落在 IP 上（通常过一阵自动恢复），不动账号。")
+        # 探针绕开了闸门，所以它必须自己把「IP 已经被限流」这件事写进闸门状态，
+        # 否则紧接着的 fetch_fans 会毫无防备地对着过热的 IP 打满 1000 次。
+        try:
+            bili_read.pause(f"probe.py 探测时被挡：{outcome}", lane="anon")
+            print("已把 anon 车道标记为暂停；等冷却结束、确认要续跑时：python bili_read.py --resume")
+        except Exception as error:  # 探针不该因为这个失败
+            print(f"（写暂停标记失败，请手动确认闸门状态：{error}）")
+        print("结论：匿名请求一样会被挡，只是后果落在 IP 上（通常过一阵自动恢复），不动账号。")
         return 1
     print("全部档位都过了 —— 这就是本次探测的上限边界之外，真实上限还要更高。")
     print("注意：这只能说明「瞬时容忍度」，测不出「一天能抽多少」。取间隔时别贴着实测边缘用。")

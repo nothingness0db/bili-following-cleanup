@@ -58,6 +58,7 @@ def main():
     rows = json.loads(SRC.read_text(encoding="utf-8"))
     results = [None] * len(rows)
     hits = 0
+    streak = 0
     client = httpx.Client(
         headers={"User-Agent": bili_read.UA, "Referer": "https://space.bilibili.com/", "Cookie": cookie},
         timeout=20,
@@ -91,7 +92,14 @@ def main():
                 bili_read.store("videos", mid, results[i])  # 只缓存成功的，失败的下次会重抓
             except bili_read.ApiError as error:
                 results[i] = blank(row, "error")
+                streak += 1
                 print(f"  跳过 {mid}：{error}")
+                if streak >= bili_read.FAIL_STREAK_LIMIT:
+                    bili_read.pause(f"连续 {streak} 个投稿请求失败，像系统性故障：{error}")
+                    raise bili_read.RiskControlError(
+                        f"连续 {streak} 个请求失败（不是单个号的问题，像是 Cookie 失效 / wbi 失效 / 认不出的风控）")
+            else:
+                streak = 0
             if (i + 1) % 50 == 0:
                 print(f"  {i + 1}/{len(rows)}（其中 {hits} 个用缓存）")
     except bili_read.RiskControlError as error:

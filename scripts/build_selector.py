@@ -47,7 +47,7 @@ uf = sum(1 for r in rows if r["unfollow"])
 pr = sum(1 for r in rows if r.get("protected"))
 print(f"建议取关合计 {uf} / {len(rows)}（其中最常访问前 {PROTECT_TOP} 保护 {pr} 个）")
 
-data = json.dumps(rows, ensure_ascii=False)
+data = json.dumps(rows, ensure_ascii=False).replace("<", "\\u003c")
 html = r"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>B站关注筛选</title>
 <style>
@@ -144,7 +144,7 @@ html = r"""<!doctype html>
 <script>
 const DATA=__DATA__;
 let order=DATA.map((_,i)=>i), selected=new Set(), expanded=new Set();
-const cats=[...new Set(DATA.map(r=>r.label))].sort((a,b)=>DATA.filter(r=>r.label===b).length-DATA.filter(r=>r.label===a).length);
+const cats=[...new Set(DATA.map(r=>r.label||''))].sort((a,b)=>DATA.filter(r=>r.label===b).length-DATA.filter(r=>r.label===a).length);
 cat.innerHTML='<option value="">全部内容</option>'+cats.map(c=>`<option>${esc(c)} (${DATA.filter(r=>r.label===c).length})</option>`).join('');
 const types=[...new Set(DATA.map(r=>r.type+':'+r.type_name))].sort((a,b)=>a.localeCompare(b));
 typ.innerHTML='<option value="">全部类型</option>'+types.map(t=>{const[id,nm]=t.split(':');const c=DATA.filter(r=>r.type===+id).length;return `<option value="${id}">${id} ${esc(nm)} (${c})</option>`}).join('');
@@ -156,7 +156,7 @@ function match(r){const q=document.getElementById('q').value.trim().toLowerCase(
   if(typ.value!==''&&String(r.type)!==typ.value)return false;
   if(pri.value&&r.priority!==pri.value)return false;
   if(!q)return true;
-  const hay=(r.uname+' '+(r.sign||'')+' '+(r.official||'')+' '+r.label+' '+r.type_name+' '+r.mid+' '+r.videos.join(' ')).toLowerCase();
+  const hay=(r.uname+' '+(r.sign||'')+' '+(r.official||'')+' '+r.label+' '+r.type_name+' '+r.mid+' '+(r.videos||[]).join(' ')).toLowerCase();
   return hay.includes(q);}
 function render(){const ul=document.getElementById('list');ul.innerHTML='';let shown=0;
   for(const idx of order){const r=DATA[idx];if(!match(r))continue;shown++;
@@ -165,7 +165,7 @@ function render(){const ul=document.getElementById('list');ul.innerHTML='';let s
       <div>
         <div class="account-heading"><span class="name">${esc(r.uname)}</span><span class="lab">${esc(r.label)}</span>${r.official?`<span class="tag">${esc(r.official)}</span>`:''}<span class="tp ${r.unfollow?'unf':''}">${r.type} ${esc(r.type_name)}</span><span class="pr ${r.priority}">${esc(r.priority)}</span>${r.protected?`<span class="prot">保护 #${r.visit_rank}</span>`:''}<span class="mid">UID ${r.mid} · 粉丝 ${fmtFans(r.fans)}${r.level!=null?' · Lv'+r.level:''}${r.last_days!=null?' · 停更'+r.last_days+'天':''}</span><a class="profile-link" href="${r.space}" target="_blank" rel="noopener noreferrer">空间 ↗</a></div>
         ${r.why?`<div class="why">↳ ${esc(r.why)}</div>`:''}
-        <div class="row-extras"><div class="row-preview" id="details-${r.mid}">${r.sign?`<div class="sign">${esc(r.sign)}</div>`:''}<div class="vids">${r.videos.map(t=>`<span>${esc(t)}</span>`).join('')||'<i>(没有抓到投稿)</i>'}</div></div><button class="expand-row" aria-label="展开或收起 ${esc(r.uname)} 的签名和投稿" aria-controls="details-${r.mid}" aria-expanded="${expanded.has(r.mid)}">${expanded.has(r.mid)?'收起':'展开'}</button></div>
+        <div class="row-extras"><div class="row-preview" id="details-${r.mid}">${r.sign?`<div class="sign">${esc(r.sign)}</div>`:''}<div class="vids">${(r.videos||[]).map(t=>`<span>${esc(t)}</span>`).join('')||'<i>(没有抓到投稿)</i>'}</div></div><button class="expand-row" aria-label="展开或收起 ${esc(r.uname)} 的签名和投稿" aria-controls="details-${r.mid}" aria-expanded="${expanded.has(r.mid)}">${expanded.has(r.mid)?'收起':'展开'}</button></div>
       </div>`;
     const checkbox=li.querySelector('.chk');
     const setSelected=value=>{checkbox.checked=value;value?selected.add(r.mid):selected.delete(r.mid);li.classList.toggle('sel',value);upd()};

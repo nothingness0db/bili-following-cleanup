@@ -33,7 +33,7 @@ def main():
 
     headers = {"Cookie": cookie, "User-Agent": bili_read.UA, "Referer": "https://www.bilibili.com/"}
     with httpx.Client(headers=headers, timeout=20, follow_redirects=True) as client:
-        count, stopped = bili_write.run(client, jct, mids, {}, LOG_JSON)
+        count, stopped = bili_write.run(client, jct, mids, {}, LOG_JSON, retry_failed=True)
 
     if stopped:
         sys.exit(f"{stopped}\n详情见 {LOG_JSON.name}；剩下的等下一批/明天再做。")
