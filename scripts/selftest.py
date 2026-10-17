@@ -137,7 +137,7 @@ def main():
 
     check("正常请求返回数据", bili_read.get_json(Ok(), "u")["code"] == 0)
     left = sql("SELECT next_at FROM gates WHERE lane='account'").fetchone()[0] - time.time()
-    check("成功后排下一次请求 3–6 秒后", 2.9 <= left <= 6.05, f"next in {left:.1f}s")
+    check("成功后排下一次请求 0.25–0.4 秒后", 0.2 <= left <= 0.45, f"next in {left:.3f}s")
 
     class Risk:
         def get(self, *a, **k):
@@ -149,7 +149,7 @@ def main():
     check("闸门被暂停", bool(paused), paused)
 
     until = sql("SELECT until_at FROM gates WHERE lane='account'").fetchone()[0] - time.time()
-    check("冷却 30 分钟", 1790 <= until <= 1805, f"{until:.0f}s")
+    check("冷却 30 分钟（IP 级冷却型风控的观测值）", 1790 <= until <= 1805, f"{until:.0f}s")
 
     notes = bili_read.resume()
     check("冷却期内 --resume 被拒绝", any("还要等" in n for n in notes), notes)

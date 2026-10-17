@@ -1,15 +1,18 @@
-"""B站接口的统一闸门：分车道限速 + 分车道熔断 + 成功响应缓存。
+"""B站接口的统一闸门：串行限速 + 分车道熔断 + 成功响应缓存。
 
-两条车道的区别不是「快慢」，而是**风控后果落在谁头上**：
+速度参数不是拍脑袋的，参照 bili-sync（同作者的 B 站同步工具）README「风控与限流须知」
+里跑在生产环境的包线：列表 250ms、评论 400ms、全局每 250ms 最多 4 个请求、遇风控终止本轮。
+本闸门是串行的，0.25–0.5 秒间隔 ≈ 2.5–4 次/秒，落在那个包线内。
 
-- `account` 车道（带 Cookie）：`fetch_following` / `fetch_videos` / `unfollow`。
-  被 -352 扣的是账号，可能连带影响取关、评论等，所以最保守：读 3–6 秒、写 8–15 秒，
-  冷却 30 分钟。
-- `anon` 车道（不带 Cookie）：`fetch_fans` 的 card / upstat 两个公开接口。
-  被扣的是本机 IP，通常过一阵自动恢复，不动账号，所以可以快一些：1–2 秒，冷却 10 分钟。
+- 读 `account` 车道（带 Cookie）：`fetch_following` / `fetch_videos`，0.25–0.4 秒。
+- 读 `anon` 车道（不带 Cookie）：`fetch_fans` 的 card / upstat，0.3–0.5 秒
+  （另外用 probe.py 实测过：0.2 秒间隔下 card / upstat 仍全过）。
+- 写（取关）：`unfollow` / `retry_unfollow`，单独定得慢得多 8–15 秒，因为它改的是
+  账号状态而不是读数据，且实测 1.5–3.5 秒串行仍会成片中招；另外还有批上限与日上限。
 
-两条车道各有独立暂停状态：匿名侧被限流不会连带停掉账号侧的操作，反之亦然。
-成功的响应按 key 缓存，中断后重跑只补缺的部分。
+风控是冷却型、偏 IP 级（bili-sync 实测换凭据无效），所以撞上之后唯一有效的动作是
+「停 + 等」，两条车道各有独立暂停状态，互不牵连；但它们不能并行跑——同一个 sqlite
+文件的写锁是库级的。成功的响应按 key 缓存，中断后重跑只补缺的部分。
 """
 import argparse
 import json
@@ -25,17 +28,25 @@ STATE_FILE = Path(__file__).resolve().parent / ".bili-read-state.sqlite3"
 
 LANES = ("account", "anon")
 
-# 车道参数：low/high 是每次请求后的间隔，cooldown 是被风控后的冷却
-LANE_RULES = {
-    "account": {"low": 3.0, "high": 6.0, "cooldown": 30 * 60},
-    "anon": {"low": 1.0, "high": 2.0, "cooldown": 10 * 60},
+# 间隔不是拍脑袋定的，参照 bili-sync（同一作者、跑在生产环境的 B 站同步工具）README
+# 「风控与限流须知」里验证过的包线：动态/列表接口 250ms、评论 400ms、全局「每 250ms
+# 最多 4 个请求」、遇风控终止本轮。本闸门是串行的，0.25–0.4s 间隔 ≈ 2.5–4 次/秒，
+# 正好落在它验证过的范围内。
+READ_INTERVAL = {
+    "account": (0.25, 0.4),
+    "anon": (0.3, 0.5),   # 实测 card/upstat 在 0.2s 间隔下仍全过，这里留余量
 }
 
-MIN_INTERVAL = LANE_RULES["account"]["low"]      # 兼容旧引用
-MAX_INTERVAL = LANE_RULES["account"]["high"]
+# 写（取关）不走这条路：它改的是账号状态，且实测 1.5–3.5s 串行仍会成片中招，
+# 所以单独定得慢得多，另外还有批上限与日上限。
 WRITE_MIN_INTERVAL = 8.0
 WRITE_MAX_INTERVAL = 15.0
-MIN_COOLDOWN = LANE_RULES["account"]["cooldown"]
+
+# 冷却：风控是 IP 级冷却型的，bili-sync 的观测是 30 分钟～1 小时自解，换凭据无效。
+COOLDOWN = {"account": 30 * 60, "anon": 30 * 60}
+
+MIN_COOLDOWN = COOLDOWN["account"]
+MIN_INTERVAL, MAX_INTERVAL = READ_INTERVAL["account"]   # 兼容旧引用
 
 CACHE_TTL = 24 * 60 * 60   # 投稿 / 粉丝：一天内算新鲜
 PAGE_TTL = 60 * 60         # 关注列表分页：一小时，避免翻页期间列表变化
@@ -157,13 +168,11 @@ def used(kind):
 
 
 def _pause(db, lane, reason):
-    rule = LANE_RULES[lane]
     db.execute("UPDATE gates SET paused=?, until_at=? WHERE lane=?",
-               (reason, time.time() + rule["cooldown"], lane))
+               (reason, time.time() + COOLDOWN[lane], lane))
 
 
 def _call(client, send, lane, low, high, raise_on_business, counter=None, daily_max=None):
-    rule = LANE_RULES[lane]
     db = connection()
     data = None
     ok = False
@@ -219,13 +228,13 @@ def _call(client, send, lane, low, high, raise_on_business, counter=None, daily_
 
 def get_json(client, url, params=None, headers=None, lane="account"):
     """读接口。lane='anon' 用于不带 Cookie 的公开接口。"""
-    rule = LANE_RULES[lane]
+    low, high = READ_INTERVAL[lane]
     return _call(
         client,
         lambda: client.get(url, params=params, headers=headers, timeout=20),
         lane,
-        rule["low"],
-        rule["high"],
+        low,
+        high,
         raise_on_business=True,
     )
 
@@ -292,8 +301,8 @@ def status():
     finally:
         db.close()
     for lane, next_at, paused, until in rows:
-        rule = LANE_RULES[lane]
-        head = f"[{lane}] 间隔 {rule['low']:.0f}–{rule['high']:.0f}s、冷却 {rule['cooldown'] / 60:.0f} 分钟"
+        low, high = READ_INTERVAL[lane]
+        head = f"[{lane}] 读 {low:g}–{high:g}s、冷却 {COOLDOWN[lane] / 60:.0f} 分钟"
         if paused:
             when = datetime.fromtimestamp(until).astimezone().isoformat(timespec="seconds")
             print(f"{head} —— 已暂停：{paused}（最早 {when} 可手动解除）")
