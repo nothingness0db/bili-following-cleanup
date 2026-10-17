@@ -45,7 +45,11 @@ description: Review and clean up a Bilibili (B站) following list end-to-end —
 
 ## 工作流（一次跑到底）
 
-拿到 Cookie 后，agent 应**一口气连续跑完全部步骤**，中途不停下来问「要不要继续」。**唯一的停顿点**是第 6 步「用户勾选」。凡可拆块并行的环节（打标 / 分类），**同时开一批 subagent**，不要一个个串行。
+拿到 Cookie 后，agent 应**连续跑完全部步骤**，中途不停下来问「要不要继续」。**唯一的停顿点**是第 6 步「用户勾选」。凡可拆块**本地分析**的环节（打标 / 分类），**同时开一批 subagent**，不要一个个串行。
+
+> **所有联网请求一律串行、低频。** 采集（`fetch_following.py` / `fetch_videos.py` / `fetch_fans.py`）读 3–6 秒一次，取关（`unfollow.py` / `retry_unfollow.py`）写 8–15 秒一次，全部走同一个闸门（`bili_read.py` + `bili_write.py`）、共用一个熔断状态。**不要**为了提速改回多线程 / 提高并发——那正是触发 `-352` 的原因。**并行只用于本地分析（打标 / 分类），不用于打接口。**
+>
+> 遇风控时脚本会**立即停掉整批**并保存已拿到的进度，不会自动重试、不会换接口续抓。成功的响应会缓存，重跑只补剩下的部分。处置办法见「遇风控怎么办」。
 
 > `build_selector.py` 是幂等的「合并 + 渲染」，每次有新数据产出（打标 / 分类 / 粉丝）后就重跑一次即可。
 
@@ -58,7 +62,7 @@ python fetch_following.py        # nav 校验登录 -> 分页 x/relation/followi
 
 ### 2. 抓每人近期投稿
 ```
-python fetch_videos.py           # wbi 签名调 x/space/wbi/arc/search，取最近 6 个投稿标题
+python fetch_videos.py           # 串行低频（走 bili_read）签名调 x/space/wbi/arc/search，取最近 6 个投稿标题
 python build_selector.py         # 生成初始 combined.json (+ selector.html)
 ```
 
@@ -129,7 +133,7 @@ python analyze_split.py          # -> chunks_analysis/aXX.json
 
 ### 5. 补粉丝量（不可跳过）
 ```
-python fetch_fans.py             # 免登录：card 取粉丝/等级，upstat 取播放/点赞 -> 写入 combined.json
+python fetch_fans.py             # 串行低频（走 bili_read）免登录：card 取粉丝/等级，upstat 取播放/点赞 -> 写入 combined.json
 python build_selector.py         # 合并分析 + 粉丝 -> 最终 selector.html
 ```
 页面显示 `粉丝 · Lv · 停更天数`，并支持「按粉丝」排序——用于处理「信息重复」：同内容里保粉丝多的、清少的。
@@ -172,12 +176,17 @@ python visualize.py              # 自动读取 recap_feature.json，生成独�
 
 ### 7. 执行取关
 ```
-python unfollow.py --yes         # POST x/relation/modify, act=2, 延时 1.5–3.5s, 412 退避 -> unfollow_log.json
+python unfollow.py --yes         # POST x/relation/modify, act=2, 8–15s 一个 -> unfollow_log.json
 ```
-若出现 `code=-352`（风控），把失败 mid 写入 `retry.txt` 后放慢重试：
+取关侧同样受闸门约束（`bili_write.py`）：**单批最多 50 个、每天最多 100 个**，撞上 `-352` / `HTTP 412` **立刻停掉整批**，不做任何退避重试。
+
+**续做就是再跑一次**，不用手写 `retry.txt`：
 ```
-python retry_unfollow.py         # 8–16s 间隔，-352 退避 25–45s -> retry_log.json
+python unfollow.py               # 日志里已成功的自动跳过，接着做剩下的
+python retry_unfollow.py         # 只想补 retry.txt 里那批时用，节奏与上面完全一致
 ```
+
+> 被风控挡下时**不要**换接口、缩短间隔或改脚本绕过——只会让账号状态更糟。等冷却结束、`python bili_read.py --resume` 之后再继续。
 
 ### 8. 收尾
 ```
@@ -191,15 +200,51 @@ python build_selector.py         # 已成功取关的自动从清单/页面剔�
 - 用户资料：`GET x/web-interface/card?mid=`、`GET x/space/upstat?mid=`（免登录）。
 - 投稿列表：`GET x/space/wbi/arc/search`，**需要 wbi 签名**（`nav` → `img_key/sub_key` 按 Mixin 表重排取前 32 位 → `md5(sorted_query + wts + key)`），实测**必须带登录 Cookie**，否则 `-352`。
 - 取关：`POST x/relation/modify`，表单 `fid / act=2 / re_src=11 / csrf=<bili_jct>`。
-- **风控 -352**：批量取关**可能**成片触发（实测一次 137 个里 26 个中招，另一次 81 个全过）；**放慢节奏**，失败后等待重试通常能补齐。
+- **风控 -352**：批量取关**可能**成片触发（实测一次 137 个里 26 个中招，另一次 81 个全过）。脚本侧已限制为每批 50 / 每天 100 并**遇风控整批停手**；剩下的分次补，不要一次冲完。读写两侧的处置见「遇风控怎么办」。
 - **粘连的 mid**：从聊天/别处复制的列表常把多个 mid 粘成一行（如 `4902922711257000280` = `490292271` + `1257000280`）。导入前必须拆开，并用 `following.json` 校验「不在关注列表」的项。
 - **隐私**：`cookie.txt` 与所有 `*.json` 数据都在 `.gitignore` 里；发布前确认没被 tracked。
+
+## 遇风控怎么办
+
+`bili_read.py` 是**所有联网请求**的统一闸门：**单线程串行 + 读 3–6 秒 / 写 8–15 秒 + 全局熔断**（`fetch_*.py`、`unfollow.py`、`retry_unfollow.py` 共用同一个 sqlite 状态，通过 `bili_write.py` 走同一条闸门）。任何一次请求一旦碰到风控信号（`code=-352` / `-412`、`HTTP 403/412/429`，或消息含「风控 / 频繁 / 访问受限」），会：
+
+1. **立刻停掉整个批次**，不再动后面的账号；
+2. 把**已拿到的部分原子落盘**（`save_json`），本地打标 / 分类 / 出页面都能继续用这部分；
+3. 把闸门**暂停 30 分钟**并打印原因——采集与取关一起被挡住。
+
+**已拿到的不会白费**：成功的响应按 key 缓存在 `scripts/.bili-read-state.sqlite3`（已 gitignore）。
+
+- 投稿 / 粉丝按 **mid** 缓存 24 小时：重跑只补没抓到的号；
+- 关注列表按 **页** 缓存 1 小时：断在第 7 页就从第 7 页继续；
+- 取关按 **mid** 记在 `unfollow_log.json`：重跑自动跳过已成功的。
+
+暂停后**该做什么**：
+
+- **等。** 不重试、不换接口、不改脚本去补抓、不试探——这些都是绕过熔断，只会更糟。
+- **做离线的事**：拿已落盘的数据跑打标 / 分类 / `build_selector.py` / `visualize.py`（全程不发请求）。
+- 查闸门状态与今日已取关数：`python bili_read.py`（只读本地，不发请求）。
+- 冷却结束后，`python bili_read.py --resume` 再重跑对应脚本——**只补剩下的部分**，不用从头再来。
+- `--resume` 只解除「本地暂停」，**不代表平台已放过**，仍需维持低频。
+- 要强制重抓某类数据：`python bili_read.py --forget-cache videos`（不带 scope 全清）。
+
+> 铁律：联网请求**只走串行低频**，并发（如 `max_workers=4`）正是实测触发 `-352` 的原因；出问题就**停**、就**等**。并行仅用于本地分析（打标 / 分类）。
+
+## 自检
+
+```
+python selftest.py               # 离线跑：不联网、不真等，30+ 项断言，退出码 0 = 全通过
+```
+改了闸门 / 缓存 / 取关脚本之后先跑这个，别拿真账号当测试环境。
 
 ## 文件产出速查
 
 | 文件 | 来源 | 内容 |
 |---|---|---|
 | `cookie.txt` | 提取/用户提供 | 登录 Cookie（敏感） |
+| `bili_read.py` | — | 统一闸门：限速 + 全局熔断 + 响应缓存（`--resume` / `--forget-cache`） |
+| `bili_write.py` | — | 取关写路径：批上限 50、日上限 100、撞风控整批停 |
+| `.bili-read-state.sqlite3` | bili_read.py | 闸门状态与缓存（本地、已 gitignore） |
+| `selftest.py` | — | 离线自检：不联网验证闸门/缓存/取关行为 |
 | `following.json/.csv` | fetch_following.py | 全量关注（含 `visit_rank` 最常访问名次） |
 | `following_videos.json` | fetch_videos.py | 每人近期投稿标题 |
 | `labels_XX.json` | 打标（推荐 subagent） | 内容定位标签 |
@@ -209,4 +254,4 @@ python build_selector.py         # 已成功取关的自动从清单/页面剔�
 | `analyze_out_XX.json` | 分类（推荐 subagent） | 类型/优先级 |
 | `unfollow.txt` | 用户/网页导出 | 待取关 mid 列表 |
 | `unfollow_log.json` | unfollow.py | 取关结果 |
-| `retry_log.json` | retry_unfollow.py | 风控重试结果 |
+| `retry_log.json` | retry_unfollow.py | 补做结果 |

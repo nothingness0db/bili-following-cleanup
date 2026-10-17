@@ -24,6 +24,9 @@ recap_insight.json
 recap_feature.json
 .preview/
 .avatar-cache/
+.bili-read-state.sqlite3*
+*.json.tmp
+.selftest/
 
 # --- Python ---
 __pycache__/

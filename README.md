@@ -16,7 +16,7 @@
 6. **补粉丝量** —— 免登录接口，辅助判断「信息重复」。
 7. **本地网页勾选** —— `selector.html`，搜索/按内容/类型/优先级勾选/导出待取关列表。
 8. **兴趣图谱** —— `visualize.py` 生成 `map.html`：脑回路 / 兴趣星系，拉动右侧「开始清理」进入勾选页面。
-9. **批量取关** —— 带随机延时 + 风控退避与重试。
+9. **批量取关** —— 8–15 秒一个、单批最多 50、每天最多 100，撞上风控**整批停下**，不重试。
 
 ## 原则：决定权归用户
 
@@ -25,6 +25,34 @@
 ## 最常访问保护
 
 关注列表接口用 `order_type=attention` 拿到的就是关注页「**最常访问**」排序（越靠前越常点进去），脚本写成 `visit_rank`。`build_selector.py` 里 `PROTECT_TOP = 50`：`visit_rank <= 50` 的号**强制**不标建议取关。这是一层硬护栏（连分类结果也覆盖），K 可自行调整；它只是参考，最终勾选仍归用户。
+
+## 串行、断路与断点续抓
+
+**所有联网请求串行、低频**：`fetch_following.py` / `fetch_videos.py` / `fetch_fans.py` / `unfollow.py` / `retry_unfollow.py` 都走同一个闸门（`bili_read.py` + `bili_write.py`，共用一份 sqlite 状态）。**不会**用多线程并发——并发（`max_workers=4`）是实测触发 `-352` 的原因。
+
+| | 读（采集） | 写（取关） |
+|---|---|---|
+| 间隔 | 3–6 秒 | 8–15 秒 |
+| 单批上限 | 不限（慢就是保护） | 50 个/次脚本 |
+| 每日上限 | — | 100 个（跨批次累计） |
+| 撞风控 | 立即整批停、暂停 30 分钟 | 同左，读写共用同一个暂停 |
+
+一旦遇到风控信号（`-352` / `-412` / `HTTP 403·412·429` / 消息含「风控·频繁·访问受限」），脚本会**立即停掉整批**、把**已拿到的部分原子落盘**、并**暂停 30 分钟**。之后：
+
+- **等**，不要重试 / 换接口 / 改脚本续抓；
+- 先做**离线**的事（打标、分类、`build_selector.py`、`visualize.py`，都不发请求）；
+- `python bili_read.py` 看闸门状态与今日已取关数（只读本地，不发请求）；
+- 冷却结束后 `python bili_read.py --resume` 解除本地暂停，再重跑对应脚本。
+
+**不用从头再来**：成功的响应按 key 缓存在本地（`scripts/.bili-read-state.sqlite3`，已在 `.gitignore` 里）。
+
+- 投稿 / 粉丝按 **mid** 缓存 24 小时 —— 重跑只补还没抓到的号，已抓的直接读缓存；
+- 关注列表按 **页** 缓存 1 小时 —— 断在第 7 页就从第 7 页继续；
+- 取关按 **mid** 记在 `unfollow_log.json` —— 重跑自动跳过已成功的，所以「补剩下的」就是再跑一次。
+
+想让某类数据强制重抓：`python bili_read.py --forget-cache videos`（不带 scope 则全清）。
+
+并行只用于**本地分析**（打标 / 分类的 subagent），不用于打接口。
 
 ## 环境
 
@@ -50,9 +78,9 @@ python build_selector.py        # 打开 selector.html，勾选后导出 unfollo
 python visualize.py             # 打开 map.html（独立兴趣图谱）
 
 # 4) 取关（先不带 --yes 会二次确认）
+python unfollow.py              # 单批 50 个上限；撞风控整批停，不重试
+# 剩下的直接再跑一次即可续做（已成功的会自动跳过，不需要手写 retry.txt）
 python unfollow.py
-# 若出现 -352 风控：把失败 mid 写入 retry.txt
-python retry_unfollow.py
 ```
 
 ## 目录
@@ -93,19 +121,29 @@ bili-following-cleanup/
 ├─ .gitignore                    # 忽略 cookie.txt 与所有数据文件
 └─ scripts/
    ├─ extract_cookie_firefox.py  # 从 Firefox 提取 Cookie
-   ├─ fetch_following.py         # 拉全量关注
-   ├─ fetch_videos.py            # 抓每人近期投稿（wbi 签名）
-   ├─ fetch_fans.py              # 补粉丝/等级/播放（免登录）
+   ├─ bili_read.py               # 闸门：读 3–6s / 写 8–15s、全局熔断、响应缓存（--resume / --forget-cache）
+   ├─ bili_write.py              # 取关写路径：批上限 50、日上限 100、撞风控整批停
+   ├─ fetch_following.py         # 拉全量关注（串行，按页缓存续抓）
+   ├─ fetch_videos.py            # 抓每人近期投稿（串行，wbi 签名，按 mid 缓存续抓）
+   ├─ fetch_fans.py              # 补粉丝/等级/播放（串行，免登录，按 mid 缓存续抓）
    ├─ split_chunks.py            # 切块供打标（推荐 subagent）
    ├─ analyze_split.py           # 切块供分类（推荐 subagent）
    ├─ build_selector.py          # 合并 + 生成 selector.html
+   ├─ selftest.py                # 离线自检：不联网跑完闸门/缓存/取关的全部行为
    ├─ unfollow.py                # 批量取关
-   └─ retry_unfollow.py          # 风控失败重试
+   └─ retry_unfollow.py          # 补做剩下的（与 unfollow.py 同节奏，不额外重试）
+```
+
+## 自检
+
+```bash
+cd scripts
+python selftest.py              # 不联网、不真等，30+ 项断言；退出码 0 表示全部通过
 ```
 
 ## 安全与合规
 
 - `cookie.txt` 是你的登录凭证，等价于账号密码的一部分：**不要提交、不要分享**。`.gitignore` 已默认忽略。
 - 所有运行产出的数据（`*.json`、`selector.html` 等）也已在 `.gitignore` 中。
-- 批量取关可能触发 B 站风控（返回 `-352`）。请放慢节奏、控制数量，自行承担账号风险。
+- 批量取关可能触发 B 站风控（返回 `-352`）。脚本已限制节奏（8–15 秒一个、每批 50、每天 100）并在风控时整批停手，但仍请自行承担账号风险。
 - 本项目仅供个人整理自己的关注列表使用。
