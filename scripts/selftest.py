@@ -50,6 +50,7 @@ import bili_write         # noqa: E402
 import fetch_following    # noqa: E402
 import fetch_fans         # noqa: E402
 import fetch_videos       # noqa: E402
+import probe              # noqa: E402
 
 FAILS = []
 
@@ -126,6 +127,7 @@ def main():
             path.unlink() if path.is_file() else path.rmdir()
     WORK.mkdir(parents=True, exist_ok=True)
     time.sleep = lambda seconds: None  # 限速照算，只是不真的等
+    real_get_json = bili_read.get_json
 
     # ================================================= 闸门本身
     print("[1] 闸门：限速 + 风控熔断")
@@ -266,6 +268,61 @@ def main():
     second = json.loads(fetch_videos.OUT.read_text(encoding="utf-8"))
     check("5 行都补齐了", all(r.get("videos") for r in second), [len(r.get("videos") or []) for r in second])
 
+    print("[3a] NAV 前先恢复缓存和旧结果；刷新失败不清空")
+    bili_read.get_json = real_get_json
+    bili_read.pause("测试暂停")
+    cookie_path = fetch_videos.COOKIE_FILE
+    fetch_videos.COOKIE_FILE = WORK / "不存在的-cookie.txt"
+    _, err = run(fetch_videos.main)
+    check("暂停中全缓存命中：不读 Cookie、不发 NAV", err is None, err)
+    fetch_videos.COOKIE_FILE = cookie_path
+
+    # 缓存过期后需刷新，但仍保留正式文件中的旧成功结果；最后一个缓存是成功的空投稿。
+    sql("UPDATE cache SET at = at - 90000")
+    bili_read.store("videos", "4", {"mid": 4, "code": 0, "videos": []})
+    source_rows = json.loads(src.read_text(encoding="utf-8"))
+    src.write_text(json.dumps(source_rows + [{"mid": 5, "uname": "new"}]), encoding="utf-8")
+    _, err = run(fetch_videos.main)
+    preserved = json.loads(fetch_videos.OUT.read_text(encoding="utf-8"))
+    check("NAV 已暂停时保留旧投稿", "已暂停" in (err or "") and preserved[0]["videos"] == second[0]["videos"], err)
+    check("NAV 被挡前也能恢复末尾空投稿缓存", preserved[4]["code"] == 0 and preserved[4]["videos"] == [])
+    check("只有没有旧结果的新账号标为 pending", [r["code"] for r in preserved] == [0, 0, 0, 0, 0, "pending"])
+
+    src.write_text(json.dumps(source_rows), encoding="utf-8")
+    sql("UPDATE cache SET at = at - 90000")
+    before_nav_error = fetch_videos.OUT.read_bytes()
+
+    def nav_error(client, url, params=None, **kwargs):
+        raise bili_read.ApiError("NAV 暂时不可用")
+
+    bili_read.get_json = nav_error
+    _, err = run(fetch_videos.main)
+    check("NAV 普通错误也不覆盖旧文件", err is not None and fetch_videos.OUT.read_bytes() == before_nav_error, err)
+
+    def video_error(client, url, params=None, **kwargs):
+        if url == fetch_videos.NAV_URL:
+            return fake_videos(client, url, params, **kwargs)
+        raise bili_read.ApiError("投稿暂时不可用")
+
+    bili_read.get_json = video_error
+    _, err = run(fetch_videos.main)
+    kept = json.loads(fetch_videos.OUT.read_text(encoding="utf-8"))
+    check("投稿普通错误保留旧成功结果（包括空投稿）",
+          "连续" in (err or "") and [r["code"] for r in kept] == [0] * 5
+          and kept[0]["videos"] == second[0]["videos"] and kept[4]["videos"] == [], err)
+
+    print("[3b] 旧探针入口已停用")
+    result, err = run(probe.main)
+    check("探针返回非零且不发请求", err is None and result == 2, err)
+    import runpy
+    argv = sys.argv
+    try:
+        sys.argv = ["probe.py", "--endpoint", "upstat", "--interval", "0.01", "--count", "100"]
+        _, err = run(runpy.run_path, str(BASE / "probe.py"), run_name="__main__")
+    finally:
+        sys.argv = argv
+    check("旧压测命令参数也只能进入停用提示", err == "2", err)
+
     # ================================================= 粉丝续抓
     print("[4] fetch_fans：card 已缓存时只补 upstat")
     reset()
@@ -291,6 +348,10 @@ def main():
     reset()
     fetch_following.OUT_JSON, fetch_following.OUT_CSV = WORK / "fl.json", WORK / "fl.csv"
     fetch_following.COOKIE_FILE = WORK / "cookie.txt"
+    old_json = b'[{"mid": "existing", "uname": "saved"}]'
+    old_csv = b'mid,uname\nexisting,saved\n'
+    fetch_following.OUT_JSON.write_bytes(old_json)
+    fetch_following.OUT_CSV.write_bytes(old_csv)
     pages = []
 
     def fake_following(client, url, params=None, **kwargs):
@@ -305,7 +366,10 @@ def main():
     bili_read.get_json = fake_following
     _, err = run(fetch_following.main)
     check("第 3 页中招 → 停", err is not None and "-352" in err, err)
-    check("已抓的 100 条落了盘", len(json.loads(fetch_following.OUT_JSON.read_text(encoding="utf-8"))) == 100)
+    checkpoint = json.loads(fetch_following.checkpoint_path().read_text(encoding="utf-8"))
+    check("已抓的 100 条另存不完整进度", checkpoint["complete"] is False and len(checkpoint["rows"]) == 100)
+    check("风控中断不改正式 JSON/CSV", fetch_following.OUT_JSON.read_bytes() == old_json
+          and fetch_following.OUT_CSV.read_bytes() == old_csv)
 
     unpause()
     pages.clear()
@@ -326,6 +390,39 @@ def main():
           len(final) == 150 and len({r["mid"] for r in final}) == 150
           and [r["visit_rank"] for r in final] == list(range(1, 151)),
           f"{len(final)} 条")
+    check("完整抓取后移除旧 partial", not fetch_following.checkpoint_path().exists())
+
+    print("[5a] 关注列表普通错误与页数上限都不能发布半份列表")
+    old_json = fetch_following.OUT_JSON.read_bytes()
+    old_csv = fetch_following.OUT_CSV.read_bytes()
+    reset()
+
+    def following_error(client, url, params=None, **kwargs):
+        if params and params["pn"] == 2:
+            raise bili_read.ApiError("临时接口错误")
+        return fake_following_ok(client, url, params, **kwargs)
+
+    bili_read.get_json = following_error
+    _, err = run(fetch_following.main)
+    check("普通错误保留完整 JSON/CSV", err is not None and fetch_following.OUT_JSON.read_bytes() == old_json
+          and fetch_following.OUT_CSV.read_bytes() == old_csv, err)
+    check("普通错误也保存 partial", len(json.loads(fetch_following.checkpoint_path().read_text(encoding="utf-8"))["rows"]) == 50)
+
+    reset()
+    page_limit = fetch_following.MAX_PAGES
+    fetch_following.MAX_PAGES = 1
+    bili_read.get_json = fake_following_ok
+    _, err = run(fetch_following.main)
+    fetch_following.MAX_PAGES = page_limit
+    check("超页数上限不发布半份列表", "清单不完整" in (err or "")
+          and fetch_following.OUT_JSON.read_bytes() == old_json and fetch_following.OUT_CSV.read_bytes() == old_csv, err)
+
+    reset()
+    fetch_following.OUT_JSON, fetch_following.OUT_CSV = WORK / "new-following.json", WORK / "new-following.csv"
+    bili_read.get_json = fake_following
+    _, err = run(fetch_following.main)
+    check("首次采集中断也不生成假全量列表", "-352" in (err or "") and not fetch_following.OUT_JSON.exists()
+          and not fetch_following.OUT_CSV.exists() and fetch_following.checkpoint_path().exists(), err)
 
     # ================================================= 写侧闸门
     print("[6] 取关：遇风控整批停、批上限、日上限、续做")

@@ -38,8 +38,7 @@ def fetch_all(client: httpx.Client, uid: int, out: list, hits: list) -> None:
     pn = 1
     while True:
         if pn > MAX_PAGES:
-            print(f"  翻页超过 {MAX_PAGES} 页，停手（total 可能报错了）")
-            break
+            raise bili_read.ApiError(f"翻页超过 {MAX_PAGES} 页，清单不完整（total 可能报错了）")
         key = f"{uid}:{pn}"
         # 分页按页缓存（1 小时）：中断后重跑只补没抓到的页，不用从第 1 页重来。
         data = bili_read.cached("following", key, bili_read.PAGE_TTL)
@@ -98,6 +97,14 @@ def write_outputs(rows: list) -> None:
         w.writerows(rows)
 
 
+def checkpoint_path():
+    return OUT_JSON.with_name(OUT_JSON.stem + ".partial.json")
+
+
+def save_checkpoint(rows, reason):
+    bili_read.save_json(checkpoint_path(), {"complete": False, "reason": reason, "rows": unique(rows)})
+
+
 def main():
     cookie = load_cookie()
     headers = {
@@ -114,20 +121,21 @@ def main():
             fetch_all(client, uid, rows, hits)
         except bili_read.RiskControlError as error:
             if rows:
-                write_outputs(unique(rows))
-                print(f"触发风控，已保存已抓的 {len(rows)} 条（清单不完整，冷却后续抓）。")
+                save_checkpoint(rows, str(error))
+                print(f"已保存 {len(rows)} 条到 {checkpoint_path().name}；完整关注列表保持原样。")
             sys.exit(f"采集暂停：{error}\n"
                      f"已抓到的页会在 1 小时内缓存，重跑只补剩下的页。")
         except bili_read.ApiError as error:
             # 关注列表接口本身就挂了（Cookie 过期 / 接口改版 / 认不出的风控）：
             # 别把 traceback 摔给用户，保住已抓的页，按系统性故障停手。
             if rows:
-                write_outputs(unique(rows))
-                print(f"接口出错，已保存已抓的 {len(rows)} 条。")
+                save_checkpoint(rows, str(error))
+                print(f"已保存 {len(rows)} 条到 {checkpoint_path().name}；完整关注列表保持原样。")
             bili_read.pause(f"关注列表接口连续失败：{error}", lane="account")
             sys.exit(f"采集中止：{error}\n这不是单页的问题，像是 Cookie 失效或接口异常；已暂停采集。")
     rows = unique(rows)
     write_outputs(rows)
+    checkpoint_path().unlink(missing_ok=True)
     print(f"完成：{len(rows)} 条（{hits[0]} 页来自缓存）-> {OUT_JSON.name} / {OUT_CSV.name}（visit_rank 按「最常访问」排序）")
 
 

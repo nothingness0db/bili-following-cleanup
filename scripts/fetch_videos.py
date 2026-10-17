@@ -54,11 +54,30 @@ def blank(row, code):
 
 
 def main():
-    cookie = load_cookie()
     rows = json.loads(SRC.read_text(encoding="utf-8"))
-    results = [None] * len(rows)
+    previous = json.loads(OUT.read_text(encoding="utf-8")) if OUT.exists() else []
+    previous = {str(r.get("mid")): r for r in previous if r.get("code") == 0}
+    results, pending = [], []
     hits = 0
     streak = 0
+    # 先填满本地结果：前置 NAV 被挡时，也不能丢掉后面尚未遍历的缓存或旧投稿。
+    for i, row in enumerate(rows):
+        mid = str(row.get("mid"))
+        body = bili_read.cached("videos", mid)
+        if body is not None:
+            hits += 1
+        else:
+            pending.append(i)
+            body = previous.get(mid) or blank(row, "pending")
+        result = dict(body)
+        result.update({key: row.get(key) for key in ("mid", "uname", "sign", "official")})
+        results.append(result)
+    if not pending:
+        bili_read.save_json(OUT, results)
+        print(f"完成：{len(rows)} 个账号全部使用缓存，未请求接口 -> {OUT.name}")
+        return
+
+    cookie = load_cookie()
     client = httpx.Client(
         headers={"User-Agent": bili_read.UA, "Referer": "https://space.bilibili.com/", "Cookie": cookie},
         timeout=20,
@@ -69,13 +88,9 @@ def main():
             wbi.refresh()
         except bili_read.ApiError as error:
             sys.exit(f"拿不到 wbi 签名密钥：{error}（Cookie 可能有问题）")
-        for i, row in enumerate(rows):
+        for i in pending:
+            row = rows[i]
             mid = str(row.get("mid"))
-            body = bili_read.cached("videos", mid)
-            if body is not None:
-                hits += 1
-                results[i] = body
-                continue
             try:
                 params = wbi.signed({"mid": row["mid"], "ps": PS, "pn": 1, "order": "pubdate", "platform": "web"})
                 d = bili_read.get_json(client, SEARCH_URL, params)
@@ -91,7 +106,8 @@ def main():
                 }
                 bili_read.store("videos", mid, results[i])  # 只缓存成功的，失败的下次会重抓
             except bili_read.ApiError as error:
-                results[i] = blank(row, "error")
+                if results[i].get("code") != 0:
+                    results[i] = blank(row, "error")
                 streak += 1
                 print(f"  跳过 {mid}：{error}")
                 if streak >= bili_read.FAIL_STREAK_LIMIT:
@@ -103,9 +119,6 @@ def main():
             if (i + 1) % 50 == 0:
                 print(f"  {i + 1}/{len(rows)}（其中 {hits} 个用缓存）")
     except bili_read.RiskControlError as error:
-        for i, row in enumerate(rows):
-            if results[i] is None:
-                results[i] = blank(row, "pending")
         bili_read.save_json(OUT, results)
         sys.exit(f"触发风控，已保存进度并暂停：{error}\n"
                  f"已抓到的下回直接从缓存补剩下的，不用从头再来。")

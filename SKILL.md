@@ -218,20 +218,20 @@ python build_selector.py         # 已成功取关的自动从清单/页面剔�
 | 冷却 | 30 分钟 | 30 分钟 | 30 分钟 |
 | 上限 | — | — | 50/批、100/天（按实际发出的请求数计） |
 
-数字来源：bili-sync 的「风控与限流须知」——动态/列表 250ms、评论 400ms、全局每 250ms 最多 4 个请求。本闸门串行 0.25–0.5s ≈ 2.5–4 次/秒，落在它的包线内。匿名侧额外用 `python probe.py` 实测过：`card` / `upstat` 在 0.2 秒间隔 ×23 个请求仍全过。
+数字来源：bili-sync 的「风控与限流须知」——动态/列表 250ms、评论 400ms、全局每 250ms 最多 4 个请求。本闸门串行 0.25–0.5s ≈ 2.5–4 次/秒，落在它的包线内。旧速率探针已停用，不用真实接口压测来验证修改。
 
 **读写为什么差这么多**：读接口的风控是冷却型、偏 IP 级（bili-sync 实测 `-403` 换 Cookie 无效，只能等），摊开请求就能过；写（取关）改的是账号状态，且实测 1.5–3.5 秒串行仍会成片中招。
 
 任何一次请求一旦碰到风控信号（`code=-352` / `-412`、`HTTP 403/412/429`，或消息含「风控 / 频繁 / 访问受限」），会：
 
 1. **立刻停掉整个批次**，不再动后面的账号（`-403 访问权限不足` / `-509` 也算风控，不只是 `-352`）；
-2. 把**已拿到的部分原子落盘**（`save_json`），本地打标 / 分类 / 出页面都能继续用这部分；
-3. 把**该车道**暂停 30 分钟并打印原因。两条车道互不牵连，所以匿名侧被限流不会挡住取关。
+2. 把**已拿到的部分原子落盘**（`save_json`）。投稿保留已有成功结果；关注列表未抓完整时只写 `following.partial.json`，不替换正式 JSON/CSV；
+3. **两条车道一起暂停**，本地最短冷却 30 分钟并打印原因；冷却后也不会自动恢复。
 
 **已拿到的不会白费**：成功的响应按 key 缓存在 `scripts/.bili-read-state.sqlite3`（已 gitignore）。
 
-- 投稿 / 粉丝按 **mid** 缓存 24 小时：重跑只补没抓到的号；
-- 关注列表按 **页** 缓存 1 小时：断在第 7 页就从第 7 页继续；
+- 投稿 / 粉丝按 **mid** 缓存 24 小时：重跑只补没抓到的号。投稿刷新失败保留旧成功结果，全命中缓存时不请求接口，也不需要 Cookie；
+- 关注列表按 **页** 缓存 1 小时：中断只写 `following.partial.json`，完整抓取成功后才替换 `following.json/.csv`；
 - 取关按 **mid** 记在 `unfollow_log.json`：重跑自动跳过已成功的。
 
 暂停后**该做什么**：
@@ -248,8 +248,7 @@ python build_selector.py         # 已成功取关的自动从清单/页面剔�
 ## 自检
 
 ```
-python selftest.py               # 离线跑：不联网、不真等，61 项断言，退出码 0 = 全通过
-python probe.py                  # 可选：匿名接口的真实速率探针（不带 Cookie，只影响本机 IP）
+python selftest.py               # 离线跑：不联网、不真等，退出码 0 = 全通过
 ```
 改了闸门 / 缓存 / 取关脚本之后先跑 `selftest.py`，别拿真账号当测试环境。
 
@@ -262,8 +261,9 @@ python probe.py                  # 可选：匿名接口的真实速率探针（
 | `bili_write.py` | — | 取关写路径：批上限 50、日上限 100、撞风控整批停 |
 | `.bili-read-state.sqlite3` | bili_read.py | 闸门状态与缓存（本地、已 gitignore） |
 | `selftest.py` | — | 离线自检：不联网验证闸门/缓存/取关行为 |
-| `probe.py` | — | 匿名接口速率探针（不带 Cookie，只影响本机 IP） |
-| `following.json/.csv` | fetch_following.py | 全量关注（含 `visit_rank` 最常访问名次） |
+| `probe.py` | — | 已停用的旧入口，不发送请求 |
+| `following.json/.csv` | fetch_following.py | 完整采集后才替换的全量关注（含 `visit_rank`） |
+| `following.partial.json` | fetch_following.py | 中断进度，`complete=false`，不当作完整列表 |
 | `following_videos.json` | fetch_videos.py | 每人近期投稿标题 |
 | `labels_XX.json` | 打标（推荐 subagent） | 内容定位标签 |
 | `combined.json` | build_selector.py | 合并后的主数据 |
