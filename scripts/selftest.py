@@ -239,6 +239,8 @@ def main():
     fetch_videos.SRC, fetch_videos.OUT = src, WORK / "following_videos.json"
     fetch_videos.COOKIE_FILE = WORK / "cookie.txt"
     fetch_videos.COOKIE_FILE.write_text("SESSDATA=x; bili_jct=y", encoding="utf-8")
+    # Existing fresh six-title caches must still be fetched when the requested size increases.
+    bili_read.store("videos", "0", {"mid": 0, "code": 0, "videos": [{"title": "old"}] * 6})
 
     calls, state = [], {"n": 0}
 
@@ -246,6 +248,7 @@ def main():
         if url.endswith("nav"):
             return {"code": 0, "data": {"wbi_img": {"img_url": "https://i0/x/" + "a" * 32 + ".png",
                                                     "sub_url": "https://i0/x/" + "b" * 32 + ".png"}}}
+        assert params["ps"] == 20
         calls.append(params["mid"])
         state["n"] += 1
         if state["n"] == 3:
@@ -279,7 +282,7 @@ def main():
 
     # 缓存过期后需刷新，但仍保留正式文件中的旧成功结果；最后一个缓存是成功的空投稿。
     sql("UPDATE cache SET at = at - 90000")
-    bili_read.store("videos", "4", {"mid": 4, "code": 0, "videos": []})
+    bili_read.store("videos", "4", {"mid": 4, "code": 0, "videos": [], "requested_ps": fetch_videos.PS})
     source_rows = json.loads(src.read_text(encoding="utf-8"))
     src.write_text(json.dumps(source_rows + [{"mid": 5, "uname": "new"}]), encoding="utf-8")
     _, err = run(fetch_videos.main)

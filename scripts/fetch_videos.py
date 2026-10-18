@@ -13,7 +13,7 @@ BASE = Path(__file__).resolve().parent
 SRC = BASE / "following.json"
 OUT = BASE / "following_videos.json"
 COOKIE_FILE = BASE / "cookie.txt"
-PS = 6
+PS = 20
 
 SEARCH_URL = "https://api.bilibili.com/x/space/wbi/arc/search"
 NAV_URL = "https://api.bilibili.com/x/web-interface/nav"
@@ -53,6 +53,12 @@ def blank(row, code):
             "official": row.get("official"), "videos": [], "code": code}
 
 
+def cache_covers(body):
+    """A cached six-title sample must not satisfy a larger page request."""
+    return (isinstance(body, dict) and body.get("code") == 0
+            and (body.get("requested_ps", 0) >= PS or len(body.get("videos", [])) >= PS))
+
+
 def main():
     rows = json.loads(SRC.read_text(encoding="utf-8"))
     previous = json.loads(OUT.read_text(encoding="utf-8")) if OUT.exists() else []
@@ -64,7 +70,7 @@ def main():
     for i, row in enumerate(rows):
         mid = str(row.get("mid"))
         body = bili_read.cached("videos", mid)
-        if body is not None:
+        if cache_covers(body):
             hits += 1
         else:
             pending.append(i)
@@ -98,8 +104,11 @@ def main():
                 results[i] = {
                     "mid": row.get("mid"), "uname": row.get("uname"), "sign": row.get("sign"),
                     "official": row.get("official"),
+                    "requested_ps": PS,
+                    "video_total": (d.get("data") or {}).get("page", {}).get("count"),
                     "videos": [
-                        {"title": v.get("title"), "play": v.get("play"), "created": v.get("created")}
+                        {"title": v.get("title"), "play": v.get("play"), "created": v.get("created"),
+                         "bvid": v.get("bvid")}
                         for v in vlist[:PS]
                     ],
                     "code": d.get("code"),
@@ -116,8 +125,9 @@ def main():
                         f"连续 {streak} 个请求失败（不是单个号的问题，像是 Cookie 失效 / wbi 失效 / 认不出的风控）")
             else:
                 streak = 0
-            if (i + 1) % 50 == 0:
-                print(f"  {i + 1}/{len(rows)}（其中 {hits} 个用缓存）")
+            if (i + 1) % 20 == 0:
+                bili_read.save_json(OUT, results)
+                print(f"  {i + 1}/{len(rows)}（其中 {hits} 个用缓存，每人最多 {PS} 条）", flush=True)
     except bili_read.RiskControlError as error:
         bili_read.save_json(OUT, results)
         sys.exit(f"触发风控，已保存进度并暂停：{error}\n"

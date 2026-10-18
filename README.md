@@ -9,18 +9,26 @@
 一条固定流水线，一次跑到底（只有「用户勾选」需要人工介入）：
 
 1. **拉全量关注** —— 登录态分页读取，导出 JSON/CSV（含「最常访问」名次 `visit_rank`）。
-2. **抓投稿** —— 抓每人最近 6 个投稿标题。
+2. **抓投稿** —— 单次请求抓每人最近 20 个投稿标题（不足 20 条按实际数量）；旧 6 条缓存不会冒充新结果。
 3. **打标** —— 生成每个号的内容定位标签（推荐用 subagent 并行）。
-4. **分类打分** —— 按 8 种取关判断给类型 + 优先级（推荐用 subagent 并行）。
+4. **分类打分** —— 按 12 类做**证据化**初评：类型、优先级、理由；`verify_analysis.py` 检查覆盖率与分布异常（如「社交礼貌关注」整类为 0、低频兴趣变成兜底桶）。内容标签与清理类型分开。
 5. **最常访问保护** —— 用 `visit_rank`（关注页「最常访问」名次）给前 50 名**硬保护**，一律不标建议取关。
 6. **补粉丝量** —— 免登录接口，辅助判断「信息重复」。
 7. **本地网页勾选** —— `selector.html`，搜索/按内容/类型/优先级勾选/导出待取关列表。
-8. **兴趣图谱** —— `visualize.py` 生成 `map.html`：脑回路 / 兴趣星系，拉动右侧「开始清理」进入勾选页面。
+8. **兴趣图谱** —— `visualize.py` 生成 `map.html`：分区布局 / 聚类布局，拉动右侧「开始清理」进入勾选页面。
 9. **批量取关** —— 8–15 秒一个、单批最多 50、每天最多 100，撞上风控**整批停下**，不重试。
 
 ## 原则：决定权归用户
 
 工具只负责**分类和呈现**，不替用户决定。agent **不会**攒一份「建议取关名单」再问「全部取关行不行」——分类只是给人**自己挑**的参考，取关名单永远来自使用者自己勾选导出。
+
+## 通用口径与个人修正分开
+
+- `scripts/classify_rubric.md` 是**通用判定口径**：只写 0–11 类各需要什么证据，名次/粉丝用本次列表的**相对分位**（`rank_pct` / `fans_pct`），不写具体账号，也不写「150 名 / 10 万粉」这种按某份列表调出来的绝对数。换一份关注列表、换一个人，用同一套规则。
+- `scripts/overrides.json` 是**这份列表的人工修正**：按 `mid` 覆盖类型/优先级/理由，`build_selector.py` 最后应用。它只对这份列表生效，不进入通用口径，也不影响别人。已在 `.gitignore` 里。
+- `analyze_out_*.json`、`combined.json`、`selector.html` 是本次运行产物，不是 skill 规则。
+
+> 想让 skill 适配另一份列表，不要改 `classify_rubric.md` 去写那个人的例子；写 `overrides.json`，或调 `PROTECT_TOP` 这类配置。
 
 ## 最常访问保护
 
@@ -94,11 +102,15 @@ python fetch_following.py
 python fetch_videos.py
 python split_chunks.py          # 再打标（推荐用 subagent）-> labels_XX.json
 
-# 3) 出图：勾选网页 + 关注星图
+# 3) 分类：切块 -> 每块一个 subagent 读 classify_rubric.md -> analyze_out_XX.json
+python analyze_split.py         # -> chunks_analysis/aXX.json + all_accounts.json
+python verify_analysis.py       # 覆盖率 + 分布护栏；硬错误必须修
+
+# 4) 出图：勾选网页 + 关注图谱
 python build_selector.py        # 打开 selector.html，勾选后导出 unfollow.txt
 python visualize.py             # 打开 map.html（独立兴趣图谱）
 
-# 4) 取关（先不带 --yes 会二次确认）
+# 5) 取关（先不带 --yes 会二次确认）
 python unfollow.py              # 单批 50 个上限；撞风控整批停，不重试
 # 剩下的直接再跑一次即可续做（已成功的自动跳过；失败项默认不再试，要重试加 --retry-failed）
 python unfollow.py
@@ -107,12 +119,13 @@ python unfollow.py --retry-failed   # 只想重试上次失败的那些时用
 
 ## 目录
 
-### 关注的形状 · 独立兴趣图谱
+### 关注内容关联图
 
 这是一层独立的视觉展示，不改变原有筛选、取关脚本和数据。
 
-- **脑回路 / 兴趣星系**：同一份关注数据在两种形态间平滑变换。
+- **分区布局 / 聚类布局**：同一份关注数据在两种形态间平滑变换。
 - **探索**：缩放、平移、拖动节点；点击兴趣分类、标签或 UP 主查看详情；搜索或随机遇见一个账号。
+- **内容吸引**：优先用 `graph_tags.json`（由 20 条投稿标题生成的 6–10 个带权标签）；取权重最高的 6 个算加权余弦，少见的共同标签权重更高，每人最多连接 4 个相关账号。账号除了互相弹簧，还会被自己的标签节点吸引（tag gravity）；只画至少两个账号共享的标签，单人标签留在详情里避免杂乱。同类作为初始布局，弹簧吸引与局部排斥调整位置，跨领域账号也可关联；拖动账号时邻居会跟随调整。脑形有边界约束，星系布局更自由。清理类型不参与吸引计算。
 - **外观**：默认跟随系统自动切换浅色 / 深色，也可手动选择；导出图片使用当前配色。
 - **开场聚焦**：镜头推近真实常访问 UP 主，展开头像与名字，再展示关注数量最多的领域和 Agent 从真实分析、评分与投稿中挑选的趣味发现。领域按 UP 主内容标签归类、以全部关注账号数量统计。可跳过，开始探索即停止；缺失数据时省略相应内容。
 - **真实头像**：按 UID 从同目录 `following.json` 补齐，只缓存并内嵌常访问第一名和第三段所选账号的头像；下载失败显示名字缩写。
@@ -132,7 +145,9 @@ python scripts/visualize.py --input path/to/combined.json --output interest-map.
 
 打开 `frontend/index.html` 可体验演示。前端源文件在 `frontend/`，修改后重新运行生成脚本。
 
-数据兼容现有 `combined.json`：`mid`、`uname`、`label`，可选 `tags`、`sign`、`fans`、`last_days`、`videos`、`visit_rank`、`protected`。兴趣大类由内容标签关键词推定；保留原始标签。图谱连线表示账号与标签、标签与兴趣大类，及共享标签的相邻账号。节点位置是视觉布局，不代表实际脑区、人格、观看时间或账号互动。
+需要本地服务时，可用 `python scripts/serve.py --directory .preview` 打开生成后的页面（默认 `http://127.0.0.1:49213/`）。服务禁止浏览器缓存，避免数据更新后仍显示旧的内嵌清理列表；筛选页会显示本轮分析时间。
+
+数据兼容现有 `combined.json`：`mid`、`uname`、`label`，可选 `tags`、`sign`、`fans`、`last_days`、`videos`、`visit_rank`、`protected`。兴趣大类由内容标签关键词推定；保留原始标签。图谱连线表示账号与标签、标签与兴趣大类，及按共享细分标签选出的内容关联。节点距离受到内容吸引与外形约束共同影响，并非精确相似度，也不代表实际脑区、人格、观看时间或账号互动。
 
 ### 文件结构
 
@@ -149,8 +164,14 @@ bili-following-cleanup/
    ├─ fetch_videos.py            # 抓每人近期投稿（串行，wbi 签名，按 mid 缓存续抓）
    ├─ fetch_fans.py              # 补粉丝/等级/播放（anon 车道，免登录，按 mid 缓存续抓）
    ├─ split_chunks.py            # 切块供打标（推荐 subagent）
-   ├─ analyze_split.py           # 切块供分类（推荐 subagent）
+   ├─ classify_rubric.md         # 通用判定口径（相对分位，不含具体账号）
+   ├─ analyze_split.py           # 生成分类输入：最近 8 条标题 + 粉丝/rank_pct/fans_pct/相似账号
+   ├─ overrides.json             # 这份列表的人工修正（按 mid 覆盖；gitignore）
+   ├─ verify_analysis.py         # 分类自检：覆盖率、类型映射、分布异常
    ├─ build_selector.py          # 合并 + 生成 selector.html
+   ├─ graph_tags_split.py        # 切图专用标签输入（20 条标题，6–10 个带权标签）
+   ├─ merge_graph_tags.py        # 合并校验 -> graph_tags.json
+   ├─ visualize.py               # 生成 map.html（有 graph_tags.json 时优先用带权标签）
    ├─ selftest.py                # 离线自检：不联网跑完闸门/缓存/取关的全部行为
    ├─ probe.py                   # 已停用的旧入口，不发送请求
    ├─ unfollow.py                # 批量取关

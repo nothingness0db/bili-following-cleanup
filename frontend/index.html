@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#fafaf8">
-<title>关注的形状 · B 站兴趣图谱</title>
+<title>B 站关注图谱</title>
 <link rel="stylesheet" href="style.css">
 <link id="dark-theme" rel="stylesheet" href="theme-dark.css" media="(prefers-color-scheme: dark)">
 </head>
@@ -10,13 +10,13 @@
 <div id="experience">
 <section id="graph-stage" aria-label="关注图谱">
 <main id="app">
-  <canvas id="universe" aria-label="关注兴趣图谱；可拖动画面、滚轮缩放，也可通过兴趣列表和搜索探索 UP 主"></canvas>
+  <canvas id="universe" aria-label="关注内容关联图；可拖动节点、滚轮缩放，也可通过内容分类和搜索查找 UP 主"></canvas>
   <header class="topbar chrome">
     <div class="top-actions"><select id="appearance" aria-label="外观"><option value="auto">跟随系统</option><option value="light">浅色</option><option value="dark">深色</option></select><label class="file-button">导入关注数据<input id="file" type="file" accept=".json,application/json"></label><button id="save" class="save-button">保存这张图 <span>↗</span></button></div>
   </header>
   <section class="intro chrome">
     <h1>关注图谱</h1>
-    <div class="view-switch" role="group" aria-label="图谱形态"><button data-view="brain" aria-pressed="true">脑回路</button><button data-view="galaxy" aria-pressed="false">兴趣星系</button></div>
+    <div class="view-switch" role="group" aria-label="布局方式"><button data-view="brain" aria-pressed="true" title="按内容大类分区，在边界内根据标签关联调整节点">分区布局</button><button data-view="galaxy" aria-pressed="false" title="根据共享内容标签聚类，通过吸引和排斥调整节点位置">聚类布局</button></div>
   </section>
   <section id="recap" class="recap chrome" aria-label="关注速写" hidden>
     <div class="recap-meta"><span id="recap-step"></span><button id="recap-skip" aria-label="跳过开场">跳过</button></div>
@@ -29,13 +29,13 @@
     <span class="spotlight-avatar"><img id="spotlight-image" alt="" referrerpolicy="no-referrer" decoding="async" hidden><span id="spotlight-initials" aria-hidden="true"></span></span>
     <strong id="spotlight-name"></strong><span id="spotlight-label"></span>
   </button>
-  <aside class="interest-panel chrome" aria-label="兴趣构成">
-    <div class="section-label"><span>兴趣构成</span><span id="topic-count">—</span></div>
+  <aside class="interest-panel chrome" aria-label="内容分类">
+    <div class="section-label"><span>内容分类</span><span id="topic-count">—</span></div>
     <div id="interests"></div><div class="interest-note">按内容标签归类</div>
     <button id="wander" class="wander"><span>随机查看 UP 主</span><span>↗</span></button>
   </aside>
   <section class="detail chrome" id="detail" hidden aria-label="选中节点详情"><button id="close-detail" class="close-button" aria-label="关闭详情">×</button><div id="detail-content"></div></section>
-  <div class="search-panel chrome"><label class="search-box"><span aria-hidden="true">⌕</span><input id="search" type="search" placeholder="寻找 UP 主 / 兴趣标签" aria-label="搜索 UP 主或兴趣标签"><kbd>/</kbd></label><div id="results" hidden></div></div>
+  <div class="search-panel chrome"><label class="search-box"><span aria-hidden="true">⌕</span><input id="search" type="search" placeholder="搜索 UP 主 / 内容标签" aria-label="搜索 UP 主或内容标签"><kbd>/</kbd></label><div id="results" hidden></div></div>
   <footer class="bottom chrome">
     <div class="metrics"><div><strong id="account-total">—</strong><span>个 UP 主</span></div><span class="metric-divider"></span><div><strong id="tag-total">—</strong><span>个标签</span></div></div>
     <div class="map-controls"><button id="recap-replay" aria-label="重播关注速写" title="重播开场">↻</button><div class="control-group"><button id="zoom-out" aria-label="缩小">−</button><button id="fit" aria-label="回到全景">⌖</button><button id="zoom-in" aria-label="放大">＋</button></div><button id="clean" class="clean-button">纯净画面 ⤢</button></div>
@@ -63,6 +63,7 @@
 <script id="selector-document" type="application/json">null</script>
 <script id="recap-feature" type="application/json">null</script>
 <script src="recap.js" defer></script>
+<script src="graph.js" defer></script>
 <script src="app.js" defer></script>
 </body>
 </html>

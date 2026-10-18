@@ -1,10 +1,15 @@
 import glob
 import json
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent
 rows = json.loads((BASE / "combined.json").read_text(encoding="utf-8"))
+TYPE_NAMES = ["保留", "退坑遗产", "信息重复", "过期工具人", "社交礼貌关注", "内容质量退化",
+              "低频兴趣", "情绪负收益", "历史纪念品", "内容转向", "商业内容过多", "账号迁移／失效"]
+CUT_TYPES = {1, 2, 3, 4, 5, 6, 7, 9, 10, 11}
+VALID_TYPES = set(range(len(TYPE_NAMES)))
 
 done = set()
 for lf in ("unfollow_log.json", "retry_log.json"):
@@ -16,19 +21,48 @@ for lf in ("unfollow_log.json", "retry_log.json"):
 rows = [r for r in rows if str(r["mid"]) not in done]
 
 an = {}
+analysis_at = None
 for f in sorted(glob.glob(str(BASE / "analyze_out_*.json"))):
     for r in json.loads(Path(f).read_text(encoding="utf-8")):
         an[str(r["mid"])] = r
+    stamp = datetime.fromtimestamp(Path(f).stat().st_mtime).isoformat(timespec="seconds")
+    analysis_at = max(analysis_at or stamp, stamp)
+
+labels = {}
+for f in sorted(glob.glob(str(BASE / "labels_*.json"))):
+    for r in json.loads(Path(f).read_text(encoding="utf-8")):
+        labels[str(r["mid"])] = r
+
+# 这份列表的人工修正：只覆盖 mid 对应的类型/优先级/理由，不改 skill 的通用口径。
+overrides = {}
+ov_path = BASE / "overrides.json"
+if ov_path.exists():
+    overrides = {str(k): v for k, v in json.loads(ov_path.read_text(encoding="utf-8")).items()}
+    print(f"应用 overrides.json：{len(overrides)} 条")
 
 PROTECT_TOP = 50
 
 for r in rows:
+    content = labels.get(str(r["mid"]), {})
+    for field in ("label", "tags", "content_reason", "confidence", "evidence_titles"):
+        if field in content:
+            r[field] = content[field]
     a = an.get(str(r["mid"]), {})
-    r["type"] = a.get("type", 0)
-    r["type_name"] = a.get("type_name", "未分类")
+    override = overrides.get(str(r["mid"]))
+    if override:
+        a = {**a, **override}
+        r["overridden"] = True
+    t = a.get("type", -1)
+    r["type"] = t
+    if a and (not isinstance(t, int) or t not in VALID_TYPES):
+        raise ValueError(f"{r['mid']} 的清理类型无效：{t}")
+    r["type_name"] = TYPE_NAMES[t] if a and isinstance(t, int) and 0 <= t < len(TYPE_NAMES) else "未分类"
     r["priority"] = a.get("priority", "低")
-    r["unfollow"] = a.get("unfollow", False)
+    r["unfollow"] = bool(a) and t in CUT_TYPES
     r["why"] = a.get("reason", "")
+    r["comparison_mids"] = a.get("comparison_mids", [])
+    if a and analysis_at:
+        r["analyzed_at"] = analysis_at
     r.pop("reco", None)
     vr = r.get("visit_rank")
     r["protected"] = vr is not None and vr <= PROTECT_TOP
@@ -48,6 +82,7 @@ pr = sum(1 for r in rows if r.get("protected"))
 print(f"建议取关合计 {uf} / {len(rows)}（其中最常访问前 {PROTECT_TOP} 保护 {pr} 个）")
 
 data = json.dumps(rows, ensure_ascii=False).replace("<", "\\u003c")
+type_names = json.dumps(TYPE_NAMES, ensure_ascii=False)
 html = r"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>B站关注筛选</title>
 <style>
@@ -143,28 +178,35 @@ html = r"""<!doctype html>
 </header><ul id="list"></ul>
 <script>
 const DATA=__DATA__;
-let order=DATA.map((_,i)=>i), selected=new Set(), expanded=new Set();
-const cats=[...new Set(DATA.map(r=>r.label||''))].sort((a,b)=>DATA.filter(r=>r.label===b).length-DATA.filter(r=>r.label===a).length);
-cat.innerHTML='<option value="">全部内容</option>'+cats.map(c=>`<option>${esc(c)} (${DATA.filter(r=>r.label===c).length})</option>`).join('');
-const types=[...new Set(DATA.map(r=>r.type+':'+r.type_name))].sort((a,b)=>a.localeCompare(b));
-typ.innerHTML='<option value="">全部类型</option>'+types.map(t=>{const[id,nm]=t.split(':');const c=DATA.filter(r=>r.type===+id).length;return `<option value="${id}">${id} ${esc(nm)} (${c})</option>`}).join('');
+const TYPE_NAMES=__TYPE_NAMES__;
+const analysisAt=DATA.map(r=>r.reviewed_at||r.analyzed_at).filter(Boolean).sort().at(-1);
+const analysisStamp=analysisAt?' · 分类更新于 '+new Date(analysisAt).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}):'';
+const priorityOrder={'高':0,'中':1,'低':2};
+let order=DATA.map((_,i)=>i).sort((a,b)=>Number(!!DATA[b].unfollow)-Number(!!DATA[a].unfollow)||(priorityOrder[DATA[a].priority]??2)-(priorityOrder[DATA[b].priority]??2)||(DATA[a].visit_rank??Infinity)-(DATA[b].visit_rank??Infinity)), selected=new Set(), expanded=new Set();
+const contentTags=r=>r.tags?.length?r.tags:[r.label||'未标注'];
+const tagCount=new Map();DATA.forEach(r=>new Set(contentTags(r)).forEach(tag=>tagCount.set(tag,(tagCount.get(tag)||0)+1)));
+const cats=[...tagCount.keys()].sort((a,b)=>tagCount.get(b)-tagCount.get(a)||a.localeCompare(b,'zh'));
+cat.innerHTML='<option value="">全部内容标签</option>'+cats.map(c=>`<option value="${esc(c)}">${esc(c)} (${tagCount.get(c)})</option>`).join('');
+typ.innerHTML='<option value="">全部清理类型</option>'+TYPE_NAMES.map((name,id)=>`<option value="${id}">${id} ${esc(name)} (${DATA.filter(r=>r.type===id).length})</option>`).join('');
+const unclassified=DATA.filter(r=>r.type===-1).length;
+if(unclassified)typ.innerHTML+=`<option value="-1">未分类 (${unclassified})</option>`;
 function esc(s){return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 function fmtFans(n){if(n==null)return '?';if(n>=100000000)return (n/100000000).toFixed(1)+'亿';if(n>=10000)return (n/10000).toFixed(1)+'万';return ''+n;}
 function match(r){const q=document.getElementById('q').value.trim().toLowerCase();
   if(document.getElementById('onlyReco').checked&&!r.unfollow)return false;
-  if(cat.value&&!cat.value.startsWith(r.label+' ('))return false;
+  if(cat.value&&!contentTags(r).includes(cat.value))return false;
   if(typ.value!==''&&String(r.type)!==typ.value)return false;
   if(pri.value&&r.priority!==pri.value)return false;
   if(!q)return true;
-  const hay=(r.uname+' '+(r.sign||'')+' '+(r.official||'')+' '+r.label+' '+r.type_name+' '+r.mid+' '+(r.videos||[]).join(' ')).toLowerCase();
+  const hay=(r.uname+' '+(r.sign||'')+' '+(r.official||'')+' '+r.label+' '+contentTags(r).join(' ')+' '+r.type_name+' '+r.mid+' '+(r.videos||[]).join(' ')).toLowerCase();
   return hay.includes(q);}
 function render(){const ul=document.getElementById('list');ul.innerHTML='';let shown=0;
   for(const idx of order){const r=DATA[idx];if(!match(r))continue;shown++;
     const li=document.createElement('li');li.dataset.mid=String(r.mid);li.classList.toggle('sel',selected.has(r.mid));li.classList.toggle('is-recommended',!!r.unfollow);li.classList.toggle('is-expanded',expanded.has(r.mid));
     li.innerHTML=`<input class="chk" type="checkbox" aria-label="选择 ${esc(r.uname)}" ${selected.has(r.mid)?'checked':''}>
       <div>
-        <div class="account-heading"><span class="name">${esc(r.uname)}</span><span class="lab">${esc(r.label)}</span>${r.official?`<span class="tag">${esc(r.official)}</span>`:''}<span class="tp ${r.unfollow?'unf':''}">${r.type} ${esc(r.type_name)}</span><span class="pr ${r.priority}">${esc(r.priority)}</span>${r.protected?`<span class="prot">保护 #${r.visit_rank}</span>`:''}<span class="mid">UID ${r.mid} · 粉丝 ${fmtFans(r.fans)}${r.level!=null?' · Lv'+r.level:''}${r.last_days!=null?' · 停更'+r.last_days+'天':''}</span><a class="profile-link" href="${r.space}" target="_blank" rel="noopener noreferrer">空间 ↗</a></div>
-        ${r.why?`<div class="why">↳ ${esc(r.why)}</div>`:''}
+        <div class="account-heading"><span class="name">${esc(r.uname)}</span><span class="lab">${esc(r.label)}</span>${contentTags(r).filter(t=>t!==r.label).map(t=>`<span class="tag">${esc(t)}</span>`).join('')}<span class="tp ${r.unfollow?'unf':''}">${r.type<0?'':r.type+' '}${esc(r.type_name)}</span><span class="pr ${r.priority}">${esc(r.priority)}</span>${r.protected?`<span class="prot">保护 #${r.visit_rank}</span>`:''}<span class="mid">UID ${r.mid} · 粉丝 ${fmtFans(r.fans)}${r.level!=null?' · Lv'+r.level:''}${r.last_days!=null?' · 停更'+r.last_days+'天':''}</span><a class="profile-link" href="${r.space}" target="_blank" rel="noopener noreferrer">空间 ↗</a></div>
+        ${r.why?`<div class="why">↳ ${esc(r.why)}${(r.comparison_mids||[]).length?'　对比：'+r.comparison_mids.map(mid=>{const other=DATA.find(item=>String(item.mid)===String(mid));return `<a href="https://space.bilibili.com/${encodeURIComponent(mid)}" target="_blank" rel="noopener noreferrer">${esc(other?.uname||String(mid))} ↗</a>`;}).join('、'):''}</div>`:''}
         <div class="row-extras"><div class="row-preview" id="details-${r.mid}">${r.sign?`<div class="sign">${esc(r.sign)}</div>`:''}<div class="vids">${(r.videos||[]).map(t=>`<span>${esc(t)}</span>`).join('')||'<i>(没有抓到投稿)</i>'}</div></div><button class="expand-row" aria-label="展开或收起 ${esc(r.uname)} 的签名和投稿" aria-controls="details-${r.mid}" aria-expanded="${expanded.has(r.mid)}">${expanded.has(r.mid)?'收起':'展开'}</button></div>
       </div>`;
     const checkbox=li.querySelector('.chk');
@@ -180,7 +222,7 @@ function render(){const ul=document.getElementById('list');ul.innerHTML='';let s
       setSelected(!checkbox.checked);
     });
     ul.appendChild(li);}
-  document.getElementById('bar').textContent=`显示 ${shown} / 共 ${DATA.length}`;upd();}
+  document.getElementById('bar').textContent=`显示 ${shown} / 共 ${DATA.length}${analysisStamp}`;upd();}
 function upd(){document.getElementById('count').textContent='已选 '+selected.size}
 function selVis(v){for(const r of DATA){if(match(r)){v?selected.add(r.mid):selected.delete(r.mid)}}render()}
 function selReco(v){for(const r of DATA){if(r.unfollow){v?selected.add(r.mid):selected.delete(r.mid)}}render()}
@@ -197,5 +239,5 @@ function exportSel(){if(!selected.size){alert('还没选任何账号');return}
 ['q','cat','typ','pri','onlyReco'].forEach(id=>document.getElementById(id).addEventListener('input',render));
 render();
 </script></body></html>"""
-(BASE / "selector.html").write_text(html.replace("__DATA__", data), encoding="utf-8")
+(BASE / "selector.html").write_text(html.replace("__DATA__", data).replace("__TYPE_NAMES__", type_names), encoding="utf-8")
 print("已更新 selector.html")

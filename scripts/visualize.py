@@ -102,6 +102,13 @@ def build(input_path=None, output_path=None, selector_path=None, feature_path=No
         if not isinstance(rows, list):
             raise ValueError("输入应为账号数组（combined.json）")
         rows = prepare_avatars(rows, source, feature)
+        graph_tags_path = source.with_name("graph_tags.json")
+        if graph_tags_path.is_file():
+            graph_tags = json.loads(graph_tags_path.read_text(encoding="utf-8-sig"))
+            for row in rows:
+                entry = graph_tags.get(str(row.get("mid")))
+                if entry:
+                    row["graph_tags"] = entry
     elif input_path:
         raise FileNotFoundError(source)
     data = json.dumps(rows, ensure_ascii=False).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
@@ -123,6 +130,7 @@ def build(input_path=None, output_path=None, selector_path=None, feature_path=No
     html = html.replace('<link id="dark-theme" rel="stylesheet" href="theme-dark.css" media="(prefers-color-scheme: dark)">', '<style id="dark-theme" media="(prefers-color-scheme: dark)">' + (FRONTEND / "theme-dark.css").read_text(encoding="utf-8-sig") + '</style>')
     html = html.replace('<script src="app.js" defer></script>', '<script id="embedded-data" type="application/json">' + data + '</script>\n<script>' + (FRONTEND / "app.js").read_text(encoding="utf-8") + '</script>')
     html = html.replace('<script src="recap.js" defer></script>', '<script>' + (FRONTEND / "recap.js").read_text(encoding="utf-8") + '</script>')
+    html = html.replace('<script src="graph.js" defer></script>', '<script>' + (FRONTEND / "graph.js").read_text(encoding="utf-8") + '</script>')
     output.write_text(html, encoding="utf-8")
     print(f"已生成 {output} · {'演示数据' if rows is None else str(len(rows)) + ' 个账号'}")
     return output

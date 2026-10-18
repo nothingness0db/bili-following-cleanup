@@ -34,7 +34,7 @@
   const BRAIN_LEFT = 'M -12 -300 C -51 -357 -151 -354 -198 -301 C -281 -320 -342 -253 -329 -195 C -396 -155 -396 -62 -352 -22 C -392 57 -348 145 -289 157 C -291 236 -211 280 -155 259 C -135 320 -51 328 -19 269 C -2 214 -16 161 -10 101 C -22 34 -10 -10 -15 -62 C -3 -139 -22 -194 -12 -300 Z';
   const brainLeft = new Path2D(BRAIN_LEFT);
   const brainRight = new Path2D(); brainRight.addPath(brainLeft, new DOMMatrix().scale(-1, 1));
-  let rows = [], nodes = [], links = [], topics = [], tags = [], accounts = [], demo = true;
+  let rows = [], nodes = [], links = [], topics = [], tags = [], accounts = [], contentEdges = [], demo = true;
   let activeTopic = null, selected = null, hovered = null, view = 'brain';
   let width = 0, height = 0, dpr = 1, frame = 0;
   let camera = {x:0,y:0,z:1}, targetCamera = {...camera}, baseScale = 1;
@@ -91,8 +91,10 @@
       if (seen.has(mid)) return null;
       seen.add(mid);
       const label = String(r.label || '未标注');
-      let rawTags = Array.isArray(r.tags) ? r.tags : [];
-      rawTags = [...new Set([...label.split(/[、，,/|·；;]/), ...rawTags.map(String)].map(s=>s.trim()).filter(Boolean))].slice(0,8);
+      const graphTags = Array.isArray(r.graph_tags) && r.graph_tags.length
+        ? r.graph_tags.map(item => typeof item === 'string' ? item : item?.tag).filter(Boolean) : [];
+      let rawTags = graphTags.length ? graphTags : (Array.isArray(r.tags) ? r.tags : []);
+      rawTags = [...new Set((rawTags.length?rawTags:label.split(/[、，,/|·；;]/)).map(ContentGraph.normalizeTag).filter(Boolean))].slice(0,10);
       const priority=[8,9,1,0,3,4,2,6,5,7];
       const primary=label.split(/[、，,/|·；;]/)[0];
       const classified=priority.find(i=>TOPICS[i].rule.test(primary)) ?? priority.find(i=>TOPICS[i].rule.test(label+' '+rawTags.join(' '))) ?? 10;
@@ -113,18 +115,29 @@
       const node = {id:`up:${row.mid}`,kind:'up',label:row.uname,topic:row._topic,row,tagNodes:[],x:0,y:0,tx:0,ty:0};
       topics[node.topic].members.push(node);
       row.tags.forEach(label=>{
-        const key = `${node.topic}:${label}`;
+        const key = label;
         if(!tagMap.has(key)) tagMap.set(key,{id:'tag:'+key,kind:'tag',label,topic:node.topic,members:[],x:0,y:0,tx:0,ty:0});
         const tag=tagMap.get(key);tag.members.push(node);node.tagNodes.push(tag);
       });
       return node;
     });
     topics = topics.filter(t=>t.members.length);
-    tags = [...tagMap.values()]; nodes = [...topics,...tags,...accounts]; links=[];
+    // 只把至少两个账号共享的标签画成节点；单人标签留在账号详情里，避免图上全是孤立小点。
+    tags = [...tagMap.values()].filter(t=>t.members.length>=2);
+    const sharedTags = new Set(tags);
+    accounts.forEach(n=>{n.tagNodes=n.tagNodes.filter(t=>sharedTags.has(t));});
+    nodes = [...topics,...tags,...accounts]; links=[];
+    contentEdges=ContentGraph.buildEdges(rows);
+    accounts.forEach(n=>{n.neighbors=[];});
+    for(const edge of contentEdges){accounts[edge.i].neighbors.push(accounts[edge.j]);accounts[edge.j].neighbors.push(accounts[edge.i]);}
+    canvas.dataset.contentEdges=String(contentEdges.length);
+    canvas.dataset.crossTopicEdges=String(contentEdges.filter(e=>accounts[e.i].topic!==accounts[e.j].topic).length);
     for(const tag of tags) {
-      const hub = topics.find(t=>t.topic===tag.topic);
-      links.push({a:hub,b:tag,kind:'branch',topic:tag.topic});
-      for(const node of tag.members) links.push({a:tag,b:node,kind:'leaf',topic:tag.topic});
+      for(const ti of new Set(tag.members.map(n=>n.topic))){
+        const hub = topics.find(t=>t.topic===ti);
+        links.push({a:hub,b:tag,kind:'branch',topic:ti});
+      }
+      for(const node of tag.members) links.push({a:tag,b:node,kind:'leaf',topic:node.topic});
     }
     $('account-total').textContent=rows.length.toLocaleString('zh-CN');
     $('tag-total').textContent=new Set(tags.map(t=>t.label)).size;
@@ -283,26 +296,30 @@
         t.members.forEach((n,i)=>{const a=i*2.39996,r=Math.sqrt((i+.5)/t.members.length)*radius;n.tx=cx+Math.cos(a)*r;n.ty=cy+Math.sin(a)*r;});
       });
     }
-    for(const tag of tags) {
-      tag.tx=tag.members.reduce((s,n)=>s+n.tx,0)/tag.members.length+(random()-.5)*14;
-      tag.ty=tag.members.reduce((s,n)=>s+n.ty,0)/tag.members.length+(random()-.5)*14;
-    }
-    for(const t of topics) {
-      t.tx=t.members.reduce((s,n)=>s+n.tx,0)/t.members.length;
-      t.ty=t.members.reduce((s,n)=>s+n.ty,0)/t.members.length;
-    }
-    // Local edges are only between accounts sharing the same real content tag.
+    accounts.forEach(n=>{n.hx=n.tx;n.hy=n.ty;});
+    relaxContent(220);
     links=links.filter(e=>e.kind!=='shared');
-    for(const tag of tags) {
-      const members=[...tag.members].sort((a,b)=>a.tx-b.tx);
-      members.forEach((n,i)=>{
-        let nearest=null,dist=Infinity;
-        for(let j=Math.max(0,i-9);j<Math.min(members.length,i+10);j++)if(j!==i){const d=Math.hypot(n.tx-members[j].tx,n.ty-members[j].ty);if(d<dist){dist=d;nearest=members[j];}}
-        if(nearest&&n.id<nearest.id)links.push({a:n,b:nearest,kind:'shared',topic:n.topic});
-      });
-    }
+    for(const edge of contentEdges)links.push({a:accounts[edge.i],b:accounts[edge.j],kind:'shared',topic:accounts[edge.i].topic,score:edge.score});
     nodes.forEach(n=>{if(initial){n.x=n.tx*.76;n.y=n.ty*.76;}if(reduceMotion){n.x=n.tx;n.y=n.ty;}});
     wake();
+  }
+
+  function relaxContent(iterations=80,pinned=null) {
+    // Solve in world coordinates, independent of zoom, with real spring attraction.
+    ctx.save();ctx.resetTransform();
+    try {
+      const accountIndex=new Map(accounts.map((n,i)=>[n,i]));
+      const tagGroups=tags.map(tag=>({
+        members:tag.members.map(n=>accountIndex.get(n)).filter(i=>i!=null),
+        weights:tag.members.map(n=>ContentGraph.weightOf(n.row,tag.label))
+      })).filter(group=>group.members.length>1);
+      ContentGraph.relax(accounts,contentEdges,{iterations,mode:view,pinned,tagGroups,
+        contains:view==='brain'?(x,y)=>ctx.isPointInPath(brainLeft,x,y)||ctx.isPointInPath(brainRight,x,y):null});
+    } finally {ctx.restore();}
+    for(const node of [...tags,...topics]){
+      node.tx=node.members.reduce((sum,n)=>sum+n.tx,0)/node.members.length;
+      node.ty=node.members.reduce((sum,n)=>sum+n.ty,0)/node.members.length;
+    }
   }
 
   function graphViewport() {
@@ -325,7 +342,7 @@
   }
   function screen(n){return {x:n.x*camera.z+camera.x,y:n.y*camera.z+camera.y};}
   function toWorld(x,y){return {x:(x-camera.x)/camera.z,y:(y-camera.y)/camera.z};}
-  function nodeVisible(n){return activeTopic===null||n.topic===activeTopic;}
+  function nodeVisible(n){return activeTopic===null||n.topic===activeTopic||(selected?.neighbors||[]).includes(n)||(selected?.tagNodes||[]).includes(n)||(selected?.members||[]).includes(n);}
   function wake(){if(!graphPaused&&!document.hidden&&!frame)frame=requestAnimationFrame(tick);}
   function pauseGraph(){graphPaused=true;if(frame)cancelAnimationFrame(frame);frame=0;}
   function resumeGraph(){graphPaused=false;wake();}
@@ -350,12 +367,12 @@
       g.save();g.translate(cam.x,cam.y);g.scale(cam.z,cam.z);g.strokeStyle=theme.outline;g.lineWidth=1/cam.z;g.stroke(brainLeft);g.stroke(brainRight);g.restore();
     }
     const highlight=exporting?null:hovered||selected||recapTarget;
-    const related=highlight?new Set([highlight,...(highlight.tagNodes||[]),...(highlight.members||[])]):null;
+    const related=highlight?new Set([highlight,...(highlight.tagNodes||[]),...(highlight.members||[]),...(highlight.neighbors||[])]):null;
     for(const e of links){
       const a=project(e.a),b=project(e.b);if(Math.max(a.x,b.x)<0||Math.min(a.x,b.x)>w||Math.max(a.y,b.y)<0||Math.min(a.y,b.y)>h)continue;
-      let alpha=e.kind==='shared'?.27:e.kind==='branch'?.27:.115;
+      let alpha=e.kind==='shared'?.16+e.score*.24:e.kind==='branch'?.22:.075;
       if(theme===SCHEMES.light)alpha*=1.2;
-      if(!exporting&&activeTopic!==null&&e.topic!==activeTopic)alpha*=.06;
+      if(!exporting&&activeTopic!==null&&e.a.topic!==activeTopic&&e.b.topic!==activeTopic)alpha*=.06;
       if(highlight){if(e.a===highlight||e.b===highlight){alpha=.65;}else if(related.has(e.a)&&related.has(e.b)){alpha=.38;}else alpha*=.25;}
       g.globalAlpha=alpha;g.strokeStyle=TOPICS[e.topic].color;g.lineWidth=e.kind==='branch'?.7:.45;
       g.beginPath();g.moveTo(a.x,a.y);const bend=e.kind==='branch'?12:3;
@@ -404,12 +421,13 @@
     stopRecap();
     selected=n;activeTopic=n.topic;renderInterests();$('results').hidden=true;
     const topic=TOPICS[n.topic];$('detail').style.setProperty('--topic',topic.color);
-    let html=`<div class="node-kind">${n.kind==='up'?'UP 主':n.kind==='topic'?'兴趣分类':'内容标签'}${demo?' · 演示':''}</div><h2>${esc(n.label)}</h2>`;
+    let html=`<div class="node-kind">${n.kind==='up'?'UP 主':n.kind==='topic'?'内容大类':'内容标签'}${demo?' · 演示':''}</div><h2>${esc(n.label)}</h2>`;
     if(n.kind==='up'){
       html+=`<div class="tags">${n.row.tags.map(t=>`<span>${esc(t)}</span>`).join('')}</div>`;
       if(n.row.sign)html+=`<p>${esc(String(n.row.sign).slice(0,180))}</p>`;
       html+=`<div class="detail-stats">粉丝 ${esc(format(n.row.fans))} · ${n.row.last_days==null?'投稿时间未知':'距上次投稿 '+esc(n.row.last_days)+' 天'}</div>`;
       if(n.row.videos.length)html+=`<p>最近投稿<br>${n.row.videos.slice(0,2).map(esc).join('<br>')}</p>`;
+      if(n.neighbors?.length)html+=`<p>内容相近</p><ul>${n.neighbors.map(other=>`<li><button data-node="${esc(other.id)}">${esc(other.label)} ↗</button></li>`).join('')}</ul>`;
       if(!demo)html+=`<a class="profile-link" href="https://space.bilibili.com/${encodeURIComponent(n.row.mid)}" target="_blank" rel="noopener noreferrer">去 B 站看看 TA ↗</a>`;
       else html+='<p>虚构示例账号 · 导入真实数据后可打开 B 站空间</p>';
     }else{
@@ -432,14 +450,14 @@
   canvas.addEventListener('pointermove',e=>{
     const r=canvas.getBoundingClientRect(),x=e.clientX-r.left,y=e.clientY-r.top;
     if(pointer&&pointer.id===e.pointerId){const dx=x-pointer.x,dy=y-pointer.y;if(Math.abs(dx)+Math.abs(dy)>2)moved=true;
-      if(dragging&&moved){const p=toWorld(x,y);dragging.tx=dragging.x=p.x;dragging.ty=dragging.y=p.y;}else if(moved){targetCamera.x+=dx;targetCamera.y+=dy;camera.x+=dx;camera.y+=dy;}
+      if(dragging&&moved){const p=toWorld(x,y);dragging.tx=dragging.x=p.x;dragging.ty=dragging.y=p.y;if(dragging.kind==='up'){dragging.hx=p.x;dragging.hy=p.y;relaxContent(8,dragging);}}else if(moved){targetCamera.x+=dx;targetCamera.y+=dy;camera.x+=dx;camera.y+=dy;}
       pointer.x=x;pointer.y=y;wake();return;
     }
     const next=pick(x,y);if(next!==hovered){hovered=next;wake();}
     canvas.style.cursor=next?'pointer':'grab';$('hover-tip').hidden=!next||clean;
     if(next&&!clean){$('hover-tip').textContent=next.label+ (next.members?' · '+next.members.length+' 个 UP 主':'');$('hover-tip').style.left=Math.min(width-245,Math.max(8,x+15))+'px';$('hover-tip').style.top=Math.max(8,Math.min(height-45,y-30))+'px';}
   });
-  function finishPointer(e){if(!pointer||pointer.id!==e.pointerId)return;if(!moved&&dragging&&!clean)select(dragging);pointer=null;dragging=null;}
+  function finishPointer(e){if(!pointer||pointer.id!==e.pointerId)return;if(!moved&&dragging&&!clean)select(dragging);if(moved&&dragging?.kind==='up'){relaxContent(100,dragging);wake();}pointer=null;dragging=null;}
   canvas.addEventListener('pointerup',finishPointer);canvas.addEventListener('pointercancel',()=>{pointer=null;dragging=null;});
   canvas.addEventListener('pointerleave',()=>{hovered=null;$('hover-tip').hidden=true;wake();});
   $('search').addEventListener('input',()=>{
@@ -448,7 +466,7 @@
     const matches=nodes.filter(n=>(n.label+' '+(n.row?.tags.join(' ')||'')+' '+(n.row?.mid||'')).toLowerCase().includes(q));
     searchMatches=new Set(matches.map(n=>n.id));$('results').hidden=false;
     if(!matches.length)$('results').innerHTML='<div class="empty-result">没有找到，换个词试试</div>';
-    matches.slice(0,30).forEach(n=>{const b=document.createElement('button');b.innerHTML=`${esc(n.label)}<small>${n.kind==='up'?'UP 主':n.kind==='topic'?'兴趣分类':'内容标签'} · ${esc(TOPICS[n.topic].name)}</small>`;b.addEventListener('click',()=>{select(n);$('search').value='';searchMatches=null;});$('results').appendChild(b);});wake();
+    matches.slice(0,30).forEach(n=>{const b=document.createElement('button');b.innerHTML=`${esc(n.label)}<small>${n.kind==='up'?'UP 主':n.kind==='topic'?'内容大类':'内容标签'} · ${esc(TOPICS[n.topic].name)}</small>`;b.addEventListener('click',()=>{select(n);$('search').value='';searchMatches=null;});$('results').appendChild(b);});wake();
   });
   $('search').addEventListener('focus',stopRecap);
   $('file').addEventListener('change',async()=>{
@@ -467,12 +485,12 @@
     const out=document.createElement('canvas');out.width=2400;out.height=1600;const g=out.getContext('2d');
     const cam={x:1350,y:790,z:view==='galaxy'?1.55:1.8};
     draw(g,2400,1600,cam,{exporting:true,names:$('export-names').checked});
-    g.textAlign='left';g.textBaseline='top';g.fillStyle=theme.muted;g.font=`22px ${FONT}`;g.fillText('关注的形状',105,85);
-    g.fillStyle=theme.ink;g.font=`54px ${FONT}`;g.fillText({brain:'关注图谱 · 脑回路',galaxy:'关注图谱 · 兴趣星系'}[view],105,210);
-    g.font=`19px ${FONT}`;g.fillStyle=theme.muted;g.fillText(`${rows.length} 个 UP 主 / ${new Set(tags.map(t=>t.label)).size} 个标签 / ${topics.length} 类兴趣`,108,300);
+    g.textAlign='left';g.textBaseline='top';g.fillStyle=theme.muted;g.font=`22px ${FONT}`;g.fillText('B 站关注内容分析',105,85);
+    g.fillStyle=theme.ink;g.font=`54px ${FONT}`;g.fillText({brain:'关注图谱 · 分区布局',galaxy:'关注图谱 · 聚类布局'}[view],105,210);
+    g.font=`19px ${FONT}`;g.fillStyle=theme.muted;g.fillText(`${rows.length} 个 UP 主 / ${new Set(tags.map(t=>t.label)).size} 个标签 / ${topics.length} 个内容大类`,108,300);
     let y=450;for(const t of [...topics].sort((a,b)=>b.members.length-a.members.length)){g.fillStyle=t.color;g.beginPath();g.arc(117,y+10,4,0,Math.PI*2);g.fill();g.font=`20px ${FONT}`;g.fillText(t.name,140,y);g.fillStyle=theme.muted;g.font=`17px ${FONT}`;g.fillText((t.members.length/rows.length*100).toFixed(1)+'%',385,y+2);y+=59;}
     g.font=`15px ${FONT}`;g.fillStyle=theme.muted;g.fillText((demo?'演示数据 · 虚构账号   /   ':'')+'按内容标签归类',108,1475);
-    out.toBlob(blob=>{if(!blob){toast('保存失败，请重试');return;}const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`bili-${view}${demo?'-demo':''}.png`;a.click();setTimeout(()=>URL.revokeObjectURL(url),10000);$('export-dialog').close();toast('已保存兴趣图谱');},'image/png');
+    out.toBlob(blob=>{if(!blob){toast('保存失败，请重试');return;}const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`bili-${view}${demo?'-demo':''}.png`;a.click();setTimeout(()=>URL.revokeObjectURL(url),10000);$('export-dialog').close();toast('已保存关注图谱');},'image/png');
   });
   const graphStage=$('graph-stage'), cleanupStage=$('cleanup-stage'), edge=$('cleanup');
   const passage=$('passage'), cleanupFrame=$('cleanup-frame');

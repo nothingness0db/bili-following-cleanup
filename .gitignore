@@ -24,6 +24,7 @@ map.html
 recap_insight.json
 recap_feature.json
 .preview/
+cleanup-review/
 .avatar-cache/
 .bili-read-state.sqlite3*
 *.json.tmp
@@ -34,3 +35,14 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# 这份列表的人工修正
+overrides.json
+
+# 图专用标签（由 20 条标题生成，个人数据）
+graph_tags/
+graph_tags.json
+
+# 个人分析产物
+interest_profile.json
+analyze_*_review.json
